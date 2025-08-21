@@ -117,5 +117,90 @@ describe("KV instance", () => {
 			const iterator = kv.keys({ start: ["users", "a"], end: ["users", "c"] });
 			testKeyIterator(iterator, 2, (key) => ["alice", "bob"].includes(key[1]));
 		});
+
+        it("should throw if start key is greater than end key", () => {
+            assert.throws(() => kv.keys({ start: ["users", "b"], end: ["users", "a"] }));
+		});
+
+        it('should throw if range query is missing either start or end', () => {
+            assert.throws(() => kv.keys({ start: ["users", "b"] }));
+            assert.throws(() => kv.keys({ end: ["users", "b"] }));
+        })
+
+		it("should retrieve keys by prefix query", () => {
+			const entries = [
+				{ key: ["users", "alice"], value: "value1" },
+				{ key: ["users", "bob"], value: "value2" },
+				{ key: ["admins", "carol"], value: "value3" },
+			];
+			for (const { key, value } of entries) {
+				kv.set(key, value);
+			}
+
+			const iterator = kv.keys({ prefix: ["users"] });
+			testKeyIterator(iterator, 2, (key) => key[0] === "users");
+		});
+
+        it("should retrieve keys by prefix query without partial matching", () => {
+			const entries = [
+				{ key: ["users", "alice"], value: "value1" },
+				{ key: ["users", "bob"], value: "value2" },
+				{ key: ["admins", "carol"], value: "value3" },
+			];
+			for (const { key, value } of entries) {
+				kv.set(key, value);
+			}
+
+			const iterator = kv.keys({ prefix: ["users", "a"] });
+			testKeyIterator(iterator, 0, () => true);
+		});
+
+		it("should retrieve keys by prefix query with start key provided", () => {
+			const entries = [
+				{ key: ["users", "alice"], value: "value1" },
+				{ key: ["users", "bob"], value: "value2" },
+				{ key: ["admins", "carol"], value: "value3" },
+			];
+			for (const { key, value } of entries) {
+				kv.set(key, value);
+			}
+
+			const iterator = kv.keys({ prefix: ["users"], start: ["users", "b"] });
+			testKeyIterator(
+				iterator,
+				1,
+				(key) => key[0] === "users" && key[1] === "bob",
+			);
+		});
+
+        it("should throw if start key is not within prefix", () => {
+            assert.throws(() => kv.keys({ prefix: ["users", "a"], start: ["users", "a"] }));
+            assert.throws(() => kv.keys({ prefix: ["users", "a"], start: ["users", "b"] }));
+            assert.throws(() => kv.keys({ prefix: ["users", "a"], start: [] }));
+		});
+
+		it("should retrieve keys by prefix query with end key provided", () => {
+			const entries = [
+				{ key: ["users", "alice"], value: "value1" },
+				{ key: ["users", "bob"], value: "value2" },
+				{ key: ["admins", "carol"], value: "value3" },
+			];
+			for (const { key, value } of entries) {
+				kv.set(key, value);
+			}
+
+			const iterator = kv.keys({ prefix: ["users"], end: ["users", "b"] });
+			testKeyIterator(
+				iterator,
+				1,
+				(key) => key[0] === "users" && key[1] === "alice",
+			);
+		});
+
+        it("should throw if end key is not within prefix", () => {
+            assert.throws(() => kv.keys({ prefix: ["users", "a"], end: ["users", "a"] }));
+            assert.throws(() => kv.keys({ prefix: ["users", "a"], end: ["users", "b"] }));
+            assert.throws(() => kv.keys({ prefix: ["users", "a"], end: [] }));
+		});
 	});
 });
