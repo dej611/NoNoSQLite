@@ -48,7 +48,6 @@ export function prepareDb(database, namespace){
       return {
         *[Symbol.iterator]() {
           for( const entry of iterator){
-            console.log({entry})
             yield { key: deserializeKeys(entry.key) };
           }
         }
