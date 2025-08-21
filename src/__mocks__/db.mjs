@@ -12,4 +12,8 @@ export class MockDB {
         this.data.set(serializedKey, value);
         return  { changes: 1 };
     }
+
+    range(start, end){
+        
+    }
 }

@@ -58,12 +58,6 @@ class KVLite {
     database.open();
 
     // prepare the statements for later usage
-    database.exec(`
-  CREATE TABLE IF NOT EXISTS ${namespace} (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  )`);
-
     this.#statements = prepareDb(database, namespace);
   }
 
@@ -112,6 +106,15 @@ class KVLite {
     const serializedKey = getSerializedKeyFromRawKey(keys);
     const ret = this.#statements.delete(serializedKey);
     return ret.changes > 0;
+  }
+
+  /**
+   * Delete all the keys in the database.
+   * @returns {void}
+   */
+  flush(){
+    this.#assertIsNotClosed();
+    this.#statements.flush();
   }
 
   /**

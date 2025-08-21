@@ -23,7 +23,7 @@ describe('setValueForKeys', () => {
         
         const result = setValueForKeys(['key2', 'key1'], testValue.value, {}, mockDB);
         assert.deepEqual(result, { ok: true });
-        assert.deepEqual(mockDB.get('key1 key2'), testValue.value);
+        assert.deepEqual(mockDB.get('key2 key1'), testValue.value);
     });
 
     it('should handle numeric keys', () => {
@@ -57,6 +57,6 @@ describe('setValueForKeys', () => {
 
         const result = setValueForKeys([false, 'a', 'b'], testValue.value, {}, mockDB);
         assert.deepEqual(result, { ok: true });
-        assert.deepEqual(mockDB.get('a b _false_'), testValue.value);
+        assert.deepEqual(mockDB.get('_false_ a b'), testValue.value);
     });
 });

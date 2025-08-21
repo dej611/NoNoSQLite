@@ -63,13 +63,15 @@ function handleStringKeys(keys){
 export function getSortedKeys(rawKeys){
     const keys = handleStringKeys(rawKeys);
     validateKeys(keys);
-    const firstKeyType = getType(keys[0]);
-    // if all keys are of the same type, sort them based on the type
-    if(keys.every(key => getType(key) === firstKeyType)){
-        const getSortingCriteria = sortingCriteria.get(firstKeyType);
-        return keys.toSorted(getSortingCriteria);
-    }
-    return keys.toSorted(sortingByType);
+    // @TODO: sort out this later
+    // const firstKeyType = getType(keys[0]);
+    // // if all keys are of the same type, sort them based on the type
+    // if(keys.every(key => getType(key) === firstKeyType)){
+    //     const getSortingCriteria = sortingCriteria.get(firstKeyType);
+    //     return keys.toSorted(getSortingCriteria);
+    // }
+    // return keys.toSorted(sortingByType);
+    return keys;
 }
 
 const KEY_PARTS_SEPARATOR = ' ';

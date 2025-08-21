@@ -35,7 +35,7 @@ describe('getValueForKeys', () => {
 
     it('should handle multiple keys', () => {
         const testValue = { value: 'multi-key-value' };
-        mockDB.upsert('key1 key2', testValue);
+        mockDB.upsert('key2 key1', testValue);
         
         const result = getValueForKeys(['key2', 'key1'], {}, mockDB);
         
@@ -84,7 +84,7 @@ describe('getValueForKeys', () => {
 
     it('should work with complex nested key structures', () => {
         // Test with arrays of keys that will be sorted
-        mockDB.upsert('a b _false_', { value: 'nested-value' });
+        mockDB.upsert('_false_ a b', { value: 'nested-value' });
 
         const result = getValueForKeys([false, 'a', 'b'], {}, mockDB);
         assert.deepEqual(result, {
