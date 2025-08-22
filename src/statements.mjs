@@ -76,8 +76,10 @@ export function prepareDb(database, namespace) {
 			};
 		},
 		prefix: (serializedPrefix, options) => {
-      // Mind to add a key separator to avoid partial matching for prefix
-			const iterator = prefixStm.iterate({ prefix: `${serializedPrefix}${KEY_PARTS_SEPARATOR}%` });
+			// Mind to add a key separator to avoid partial matching for prefix
+			const iterator = prefixStm.iterate({
+				prefix: `${serializedPrefix}${KEY_PARTS_SEPARATOR}%`,
+			});
 			return {
 				*[Symbol.iterator]() {
 					for (const entry of iterator) {

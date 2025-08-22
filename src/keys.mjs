@@ -86,7 +86,10 @@ function isGreater(startKey, endKey) {
 function isInPrefix(key, prefix) {
 	const encodedKey = getSerializedKeyFromRawKey(key);
 	const encodedPrefix = getSerializedKeyFromRawKey(prefix);
-	return encodedKey.startsWith(encodedPrefix) && encodedKey.length > encodedPrefix.length;
+	return (
+		encodedKey.startsWith(encodedPrefix) &&
+		encodedKey.length > encodedPrefix.length
+	);
 }
 
 function validateSelectorKeys(selector) {
