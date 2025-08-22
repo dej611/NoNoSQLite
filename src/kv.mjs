@@ -1,4 +1,6 @@
+import EventEmitter from "node:events";
 import { DatabaseSync } from "node:sqlite";
+import { Readable } from "node:stream";
 import { DATABASE_IS_CLOSED } from "./errors.mjs";
 import { getValueForKeys, getValuesForMultipleKeys } from "./get.mjs";
 import { findBySelector, getSerializedKeyFromRawKey } from "./keys.mjs";
@@ -43,6 +45,7 @@ class KVLite {
 	#closed;
 
 	#statements;
+	#keysListener;
 
 	/**
 	 * Create a new instance of a Key Value database.
@@ -56,6 +59,8 @@ class KVLite {
 
 		// prepare the statements for later usage
 		this.#statements = prepareDb(database, namespace);
+
+		this.#keysListener = new EventEmitter();
 	}
 
 	#assertIsNotClosed() {
@@ -69,7 +74,14 @@ class KVLite {
 	#addKeysToWatcher(manyKeys) {
 		for (const keys of manyKeys) {
 			const serializedKey = getSerializedKeyFromRawKey(keys);
-			this.$watchedKeys.add(serializedKey);
+			this.#watchedKeys.add(serializedKey);
+		}
+	}
+
+	#removeKeysFromWatcher(manyKeys) {
+		for (const keys of manyKeys) {
+			const serializedKey = getSerializedKeyFromRawKey(keys);
+			this.#watchedKeys.delete(serializedKey);
 		}
 	}
 
@@ -163,7 +175,8 @@ class KVLite {
 		const ret = setValueForKeys(key, value, options, this.#statements);
 		const serializedKey = getSerializedKeyFromRawKey(key);
 		if (ret.ok && this.#isKeyWatched(serializedKey)) {
-			// @TODO: implement the emit logic
+			console.log("emitting key", serializedKey);
+			this.#keysListener.emit(serializedKey, value);
 		}
 		return ret;
 	}
@@ -177,7 +190,49 @@ class KVLite {
 	watch(keys, options) {
 		this.#assertIsNotClosed();
 		this.#addKeysToWatcher(keys);
-		// @TODO: write this later
+		const listeners = [];
+
+		const ac = new AbortController();
+
+		const values = new WeakMap();
+
+		for (const key of keys) {
+			const listener = (value) => {
+				if (values.get(key) !== value) {
+					// add the value to the local map
+					// it is ok to overwrite if not consumed yet
+					values.set(key, value);
+				}
+			};
+			this.#keysListener.on(getSerializedKeyFromRawKey(key), listener);
+			listeners.push(listener);
+		}
+
+		function* generate() {
+			while (true) {
+				const entries = [];
+				for (const key of keys) {
+					const value = values.get(key) ?? null;
+					entries.push({ key, value });
+					// make sure to clear up the local map once dumped
+					values.delete(key);
+				}
+				// console.log({ entries });
+				if (entries.some((entry) => entry.value !== null)) {
+					yield entries;
+				}
+			}
+		}
+
+		const readable = Readable.from(generate(), { emitClose: true });
+		readable.on("close", () => {
+			keys.forEach((key, i) => {
+				this.#keysListener.off(getSerializedKeyFromRawKey(key), listeners[i]);
+			});
+			this.#removeKeysFromWatcher(keys);
+			ac.abort();
+		});
+		return readable;
 	}
 }
 
