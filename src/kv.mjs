@@ -14,7 +14,6 @@ import {
 	prefixBounds,
 } from "./keys.mjs";
 import { prepareDb } from "./statements.mjs";
-import { deserializeValue } from "./utils.mjs";
 
 const IN_MEMORY_DB = ":memory:";
 
@@ -202,9 +201,13 @@ class KVStore {
 	 * UPSERT semantics, where a no-op write of an identical value also
 	 * reports zero changed rows.
 	 *
-	 * Watchers observe a fresh clone of `value` (same v8 structured-clone
-	 * codec used for storage), not the reference passed in — consistent with
+	 * Watchers observe a fresh clone of `value` (via the platform
+	 * `structuredClone`), not the reference passed in — consistent with
 	 * `get()` and immune to the caller mutating `value` after this returns.
+	 * Cloned directly from the input rather than round-tripped through the
+	 * v8-serialized storage bytes, since the two codecs accept the same set
+	 * of types (see utils.mjs `serializeValue`) and skipping the round-trip
+	 * avoids doing it at all when nothing is watching (guarded below).
 	 * @param {KeyValue} key
 	 * @param {*} value - any value supported by the v8 structured-clone codec
 	 *   (see utils.mjs `serializeValue`), including `BigInt` and `undefined`.
@@ -213,13 +216,13 @@ class KVStore {
 	set(key, value) {
 		this.#assertIsNotClosed();
 		const { normalized, encoded } = encodeKey(key);
-		const serializedValue = this.#statements.upsert(encoded, value);
+		this.#statements.upsert(encoded, value);
 		if (this.#keyEmitter.listenerCount(KEY_CHANGED) > 0) {
 			this.#keyEmitter.emit(KEY_CHANGED, {
 				type: "set",
 				encodedKey: encoded,
 				normalizedKey: normalized,
-				value: deserializeValue(serializedValue),
+				value: structuredClone(value),
 			});
 		}
 	}

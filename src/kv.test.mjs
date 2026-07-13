@@ -977,4 +977,27 @@ describe("file-backed store", () => {
 		kv.close();
 		assert.ok(!existsSync(`${path}-wal`));
 	});
+
+	it("watch() does not observe writes made through a different KVStore instance on the same file (regression: cross-instance scope)", async () => {
+		const path = join(dir, "shared.sqlite");
+		const writer = openKv({ path });
+		const reader = openKv({ path });
+
+		const sub = reader.watch({ prefix: [] });
+		const seen = [];
+		sub.on("data", (event) => seen.push(event));
+
+		writer.set(["from-writer"], 1);
+		writer.delete(["from-writer"]);
+		writer.clear();
+		// Give any (wrongly) cross-instance event a chance to arrive before
+		// asserting its absence.
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.deepEqual(seen, []);
+
+		sub.destroy();
+		writer.close();
+		reader.close();
+	});
 });

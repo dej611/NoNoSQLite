@@ -133,6 +133,21 @@ this class execute synchronously. Instances are created with
 [`kvstore.openKv([options])`][], not with `new` — `KVStore` is exported only
 so callers can perform `instanceof` checks and reference the type.
 
+**Blocking I/O.** Every method that touches the database ([`kv.get(key)`][],
+[`kv.set(key, value)`][], [`kv.delete(key)`][], [`kv.clear()`][],
+[`kv.keys(selector)`][], [`kv.getMany(keys)`][]) blocks the event loop for the
+duration of the underlying `node:sqlite` call — there is no async variant,
+matching `node:sqlite`'s own `DatabaseSync`. For an in-memory store this is
+sub-microsecond per call and rarely noticeable. For a file-backed store, each
+write also waits on a disk `fsync` (mitigated, not eliminated, by the
+always-on `WAL` mode described under [`kvstore.openKv([options])`][] below):
+on a representative local SSD, `kv.set()` on a file-backed store measured
+around 20 microseconds per call (~47,000 ops/sec) — small in isolation, but
+on a single-threaded event loop every concurrent request pays that latency
+serially. Avoid file-backed `KVStore` calls directly inside a hot request
+path serving concurrent traffic; prefer batching writes, moving them off the
+request path, or using a worker thread if write volume is high.
+
 ### `kv.clear()`
 
 <!-- YAML
@@ -353,6 +368,15 @@ added: REPLACEME
 
 Watches mutations on the store, or messages on a custom topic.
 
+**Scope.** Like the topic plane (see [Topic plane][] below), `key`/`keys`/
+`prefix` watchers only observe mutations made through the *same* `KVStore`
+instance, in the same process. A file-backed store mutated by another
+process, or by a second `openKv({ path })` call in the same process pointed
+at the same file, produces no watch events on this instance — `node:sqlite`
+gives this module no cross-connection change feed to build on. If you need
+writes from another process or instance to be observable, poll
+[`kv.keys(selector)`][] instead.
+
 Key / keys / prefix watchers emit one of:
 
 ```js
@@ -455,6 +479,18 @@ the database file while it's open. They're removed automatically on a clean
 it open, copy the sidecars too (or checkpoint first) — copying just the
 `.sqlite` file mid-write is not safe.
 
+**Security: only open files you trust.** `path` must point at a database
+this module (or a trusted process) created. A stored value is read back with
+[`v8.deserialize()`][] (see [Type conversion between JavaScript and stored
+values][]), which — like `JSON.parse()`, but for the V8-internal wire format
+— executes as soon as any value in the file is read, including via
+[`kv.keys(selector)`][] range/prefix scans. Opening a `path` containing
+attacker-controlled bytes means running `v8.deserialize()` over data you
+don't control; treat an untrusted `.sqlite` file the same way you'd treat any
+other untrusted serialized-object input, and don't accept one from a
+different trust boundary (e.g. a file uploaded by a user) without validating
+it out-of-band first.
+
 ## Errors
 
 Every error thrown by this module is a plain `Error`, `TypeError`, or
@@ -504,8 +540,13 @@ try {
 [Topic plane]: #topic-plane
 [Type conversion between JavaScript and stored values]: #type-conversion-between-javascript-and-stored-values
 [`KVStore`]: #class-kvstore
+[`kv.clear()`]: #kvclear
 [`kv.close()`]: #kvclose
+[`kv.delete(key)`]: #kvdeletekey
 [`kv.get(key)`]: #kvgetkey
+[`kv.getMany(keys)`]: #kvgetmanykeys
+[`kv.keys(selector)`]: #kvkeysselector
 [`kv.publish(topic, payload)`]: #kvpublishtopic-payload
 [`kv.set(key, value)`]: #kvsetkey-value
+[`v8.deserialize()`]: v8.md#v8deserializebuffer
 [`kvstore.openKv([options])`]: #kvstoreopenkvoptions

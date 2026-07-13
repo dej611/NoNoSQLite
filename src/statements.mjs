@@ -101,9 +101,7 @@ export function prepareDb(database, { isMemory } = {}) {
 
 	return {
 		upsert: (serializedKey, value) => {
-			const serializedValue = serializeValue(value);
-			upsertStm.run(toBlob(serializedKey), serializedValue);
-			return serializedValue;
+			upsertStm.run(toBlob(serializedKey), serializeValue(value));
 		},
 		get: (serializedKey) => {
 			const entry = selectStm.get({ key: toBlob(serializedKey) });
