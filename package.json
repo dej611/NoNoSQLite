@@ -1,6 +1,6 @@
 {
 	"name": "nonosqlite",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "A thin JavaScript layer to use the Node.js SQLite module as a NoSQL key-value store.",
 	"license": "MIT",
 	"type": "module",

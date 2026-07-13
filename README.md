@@ -29,6 +29,17 @@ See [EXAMPLES.md](EXAMPLES.md) for an index, or run them all with:
 npm run examples
 ```
 
+## Versioning
+
+This is pre-1.0 and the version number means it: `0.x` reflects real,
+accumulated progress (CI, coverage, docs, bug fixes — see
+[CHANGELOG.md](CHANGELOG.md)), not API stability. `1.0.0` is intentionally
+being held back until a couple of open design questions are resolved: whether
+`get()`/`getMany()` need a `versionstamp` to distinguish an absent key from a
+stored `null`, and whether atomic/compare-and-set operations belong in the
+core API (see [SPEC-DECISIONS.md](SPEC-DECISIONS.md), items N4 and N6) —
+either could still change the public API shape.
+
 ## License
 
 MIT
