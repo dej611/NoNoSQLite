@@ -1,0 +1,34 @@
+{
+	"name": "nonosqlite",
+	"version": "0.1.0",
+	"description": "A thin JavaScript layer to use the Node.js SQLite module as a NoSQL key-value store.",
+	"license": "MIT",
+	"type": "module",
+	"main": "./src/kv.mjs",
+	"types": "./kv.d.ts",
+	"exports": {
+		".": {
+			"types": "./kv.d.ts",
+			"import": "./src/kv.mjs"
+		}
+	},
+	"files": ["src", "kv.d.ts", "kv.md", "README.md", "LICENSE"],
+	"engines": {
+		"node": ">=22.5"
+	},
+	"scripts": {
+		"test": "node --test 'src/**/*.test.mjs'",
+		"lint": "biome check src/",
+		"format": "biome format --write src/",
+		"examples": "for f in examples/*.mjs; do echo \"--- $f ---\"; NODE_NO_WARNINGS=1 node \"$f\" || exit 1; done",
+		"bundle": "node scripts/bundle.mjs",
+		"test:bundle": "npm run bundle && node --test dist/kv.bundle.test.mjs",
+		"typecheck": "tsc --noEmit",
+		"test:all": "npm run test && npm run test:bundle && npm run typecheck"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.2.0",
+		"@types/node": "^26.1.1",
+		"typescript": "^7.0.2"
+	}
+}
