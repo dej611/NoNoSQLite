@@ -26,7 +26,8 @@
 		"test:bundle": "npm run bundle && node --test dist/kv.bundle.test.mjs",
 		"typecheck": "tsc --noEmit",
 		"bench": "NODE_NO_WARNINGS=1 node bench/run.mjs",
-		"test:all": "npm run test:coverage && npm run test:bundle && npm run typecheck"
+		"lint:docs": "node scripts/check-docs.mjs",
+		"test:all": "npm run test:coverage && npm run test:bundle && npm run typecheck && npm run lint:docs"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.2.0",
