@@ -1,46 +1,46 @@
 export const UNKNOWN_TYPE = "unknown";
 
 export function isString(value) {
-	return typeof value === "string" || value instanceof String;
-}
-
-export function isBoolean(value) {
-	return typeof value === "boolean" || value instanceof Boolean;
-}
-
-export function isNumber(value) {
-	return typeof value === "number" || value instanceof Number;
-}
-
-export function isBigInt(value) {
-	return typeof value === "bigint";
+	return typeof value === "string";
 }
 
 export function getType(value) {
-	if (isString(value)) {
-		return "string";
-	}
-	if (isNumber(value)) {
-		return "number";
-	}
-	if (isBoolean(value)) {
-		return "boolean";
-	}
-	if (isBigInt(value)) {
-		return "bigint";
+	const t = typeof value;
+	if (t === "string" || t === "number" || t === "boolean" || t === "bigint") {
+		return t;
 	}
 	return UNKNOWN_TYPE;
 }
 
-const MAX_BYTE_LENGTH = 1024;
-export function isMaxBufferSize(keys) {
-	return new Blob(keys).size > MAX_BYTE_LENGTH;
+export const MAX_KEY_BYTE_LENGTH = 1024;
+
+/**
+ * `encoded` is a "binary string": one JS UTF-16 code unit (range 0x00-0xFF)
+ * per raw byte (see keys.mjs). Under that mapping `.length` already equals
+ * the byte count directly — no `Buffer.byteLength` re-encoding needed.
+ */
+export function exceedsKeyByteLimit(encoded) {
+	return encoded.length > MAX_KEY_BYTE_LENGTH;
 }
 
+import { deserialize, serialize } from "node:v8";
+
+/**
+ * Serialize a value for storage using the Node `v8` structured-clone codec.
+ *
+ * Covers everything `postMessage` can transfer: primitives (incl. `undefined`,
+ * `BigInt`), `Date`, `RegExp`, `Map`, `Set`, typed arrays, `ArrayBuffer`,
+ * sparse arrays, and circular references. Functions and class identities
+ * still cannot be preserved — class instances round-trip as plain objects.
+ *
+ * The byte format is V8-internal: stable across Node versions, but not
+ * portable to other runtimes (Bun/Deno/browser). Switch to a wire format
+ * like CBOR if cross-runtime portability becomes a requirement.
+ */
 export function serializeValue(value) {
-	return JSON.stringify(value);
+	return serialize(value);
 }
 
-export function deserializeValue(serializedValue) {
-	return JSON.parse(serializedValue);
+export function deserializeValue(buffer) {
+	return deserialize(buffer);
 }

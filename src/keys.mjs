@@ -1,130 +1,400 @@
-import { KEY_PARTS_SEPARATOR, SERIALIZED_CONSTANTS } from "./constants.mjs";
 import {
-	KEY_SELECTOR_INVALID,
-	KEY_SELECTOR_RANGE_END_NOT_IN_PREFIX,
-	KEY_SELECTOR_RANGE_INVALID,
-	KEY_SELECTOR_RANGE_START_NOT_IN_PREFIX,
-	KEY_SELECTOR_RANGE_START_OVER_END,
-	KEYS_EMPTY_STRING,
-	KEYS_MAX_BUFFER_SIZE,
-	KEYS_MUST_BE_ARRAY,
-	KEYS_UNKNOWN_TYPE,
+	MAX_BIGINT_MAGNITUDE_BYTES,
+	PREFIX_LOW_MARKER,
+	STRING_ESCAPE,
+	STRING_TERMINATOR,
+	TAG_BIGINT,
+	TAG_BOOLEAN,
+	TAG_NUMBER,
+	TAG_STRING,
+} from "./constants.mjs";
+import {
+	ERR_KVSTORE_BIGINT_TOO_LARGE,
+	ERR_KVSTORE_INVALID_KEY,
+	ERR_KVSTORE_INVALID_SELECTOR,
 } from "./errors.mjs";
-import { getType, isMaxBufferSize, isString, UNKNOWN_TYPE } from "./utils.mjs";
+import {
+	exceedsKeyByteLimit,
+	getType,
+	isString,
+	UNKNOWN_TYPE,
+} from "./utils.mjs";
+
+function validateSegments(keys, ErrorClass) {
+	if (keys.some((key) => isString(key) && key === "")) {
+		throw new ErrorClass("key segments cannot be an empty string");
+	}
+	if (keys.some((key) => getType(key) === UNKNOWN_TYPE)) {
+		throw new ErrorClass(
+			"key segments must be a string, number, bigint, or boolean",
+		);
+	}
+	if (keys.some((key) => typeof key === "number" && Number.isNaN(key))) {
+		throw new ErrorClass("NaN is not a valid key segment");
+	}
+}
 
 function validateKeys(keys) {
 	if (!Array.isArray(keys)) {
-		throw new Error(KEYS_MUST_BE_ARRAY);
+		throw new ERR_KVSTORE_INVALID_KEY("key must be an array of segments");
 	}
 	if (keys.length < 1) {
-		throw new Error(KEYS_ARRAY_EMPTY);
+		throw new ERR_KVSTORE_INVALID_KEY("key must have at least one segment");
 	}
-	if (keys.some((key) => isString(key) && key.trim() === "")) {
-		throw new Error(KEYS_EMPTY_STRING);
-	}
-	if (keys.some((key) => getType(key) === UNKNOWN_TYPE)) {
-		throw new Error(KEYS_UNKNOWN_TYPE);
-	}
-	if (isMaxBufferSize(keys)) {
-		throw new Error(KEYS_MAX_BUFFER_SIZE);
-	}
+	validateSegments(keys, ERR_KVSTORE_INVALID_KEY);
 }
 
-function handleStringKeys(keys) {
-	return isString(keys) ? [keys] : keys;
+/**
+ * Looser than `validateKeys`: an empty array is a valid prefix meaning
+ * "no constraint, match every key" — `{ prefix: [] }` is the documented
+ * full-scan recipe.
+ */
+function validatePrefixSegments(keys) {
+	if (!Array.isArray(keys)) {
+		throw new ERR_KVSTORE_INVALID_SELECTOR(
+			"prefix must be an array of segments",
+		);
+	}
+	validateSegments(keys, ERR_KVSTORE_INVALID_SELECTOR);
 }
 
-export function getSortedKeys(rawKeys) {
-	const keys = handleStringKeys(rawKeys);
+/**
+ * Copies an array input so the normalized key returned to callers (and
+ * stashed in `get`/`getMany`/`delete`/`watch` results) never aliases the
+ * caller's own array — mirrors the clone-on-read guarantee already made for
+ * values (see `set()`'s doc comment in kv.mjs). The string-shorthand path
+ * already allocates a fresh array, so only the array path needs a copy.
+ */
+function toOwnedArray(rawKeys) {
+	if (isString(rawKeys)) return [rawKeys];
+	return Array.isArray(rawKeys) ? rawKeys.slice() : rawKeys;
+}
+
+export function normalizeKeys(rawKeys) {
+	const keys = toOwnedArray(rawKeys);
 	validateKeys(keys);
 	return keys;
 }
 
+function normalizePrefixKeys(rawKeys) {
+	const keys = toOwnedArray(rawKeys);
+	validatePrefixSegments(keys);
+	return keys;
+}
+
+function toBinaryString(buf) {
+	return buf.toString("latin1");
+}
+
+function toBuffer(binaryString) {
+	return Buffer.from(binaryString, "latin1");
+}
+
+// --- string segment: escape+terminate, preserves UTF-8 byte order ---------
+
+function encodeStringSegment(value) {
+	const bytes = Buffer.from(value, "utf8");
+	let out = String.fromCharCode(TAG_STRING);
+	for (const byte of bytes) {
+		const ch = String.fromCharCode(byte);
+		out +=
+			ch === STRING_TERMINATOR || ch === STRING_ESCAPE
+				? STRING_ESCAPE + ch
+				: ch;
+	}
+	return out + STRING_TERMINATOR;
+}
+
+function decodeStringSegment(str, offset) {
+	let raw = "";
+	let i = offset;
+	for (;;) {
+		const ch = str[i];
+		if (ch === undefined) {
+			throw new ERR_KVSTORE_INVALID_KEY(
+				"corrupt key encoding: truncated string segment",
+			);
+		}
+		if (ch === STRING_ESCAPE) {
+			raw += str[i + 1];
+			i += 2;
+			continue;
+		}
+		if (ch === STRING_TERMINATOR) {
+			i += 1;
+			break;
+		}
+		raw += ch;
+		i += 1;
+	}
+	return { value: toBuffer(raw).toString("utf8"), nextOffset: i };
+}
+
+// --- number segment: sign-flipped float64, order-preserving ---------------
+
+const SIGN_MASK = 0x8000000000000000n;
+const ALL_ONES_64 = 0xffffffffffffffffn;
+
+function encodeNumberSegment(value) {
+	if (Number.isNaN(value)) {
+		throw new ERR_KVSTORE_INVALID_KEY("NaN is not a valid key segment");
+	}
+	const normalized = Object.is(value, -0) ? 0 : value;
+	const raw = Buffer.alloc(8);
+	raw.writeDoubleBE(normalized, 0);
+	const bits = raw.readBigUInt64BE(0);
+	const flipped = bits & SIGN_MASK ? ~bits & ALL_ONES_64 : bits | SIGN_MASK;
+	const out = Buffer.alloc(8);
+	out.writeBigUInt64BE(flipped, 0);
+	return String.fromCharCode(TAG_NUMBER) + toBinaryString(out);
+}
+
+function decodeNumberSegment(str, offset) {
+	const buf = toBuffer(str.slice(offset, offset + 8));
+	const bits = buf.readBigUInt64BE(0);
+	const unflipped =
+		bits & SIGN_MASK ? bits & ~SIGN_MASK & ALL_ONES_64 : ~bits & ALL_ONES_64;
+	const out = Buffer.alloc(8);
+	out.writeBigUInt64BE(unflipped, 0);
+	return { value: out.readDoubleBE(0), nextOffset: offset + 8 };
+}
+
+// --- bigint segment: sign + order-corrected length + magnitude ------------
+
+function bigintMagnitudeBytes(abs) {
+	if (abs === 0n) return Buffer.alloc(0);
+	let hex = abs.toString(16);
+	if (hex.length % 2 !== 0) hex = `0${hex}`;
+	return Buffer.from(hex, "hex");
+}
+
+function encodeBigintSegment(value) {
+	const negative = value < 0n;
+	const magnitude = bigintMagnitudeBytes(negative ? -value : value);
+	if (magnitude.length > MAX_BIGINT_MAGNITUDE_BYTES) {
+		throw new ERR_KVSTORE_BIGINT_TOO_LARGE(
+			`bigint magnitude exceeds ${MAX_BIGINT_MAGNITUDE_BYTES} bytes and cannot be encoded as a key segment`,
+		);
+	}
+	// For negative values, both the length byte and every magnitude byte are
+	// bit-complemented so that a larger magnitude (a more negative number)
+	// sorts *before* a smaller one.
+	const signByte = negative ? 0 : 1;
+	const lengthByte = negative ? 0xff ^ magnitude.length : magnitude.length;
+	const magBytes = negative
+		? Buffer.from(magnitude.map((b) => 0xff ^ b))
+		: magnitude;
+	return (
+		String.fromCharCode(TAG_BIGINT, signByte, lengthByte) +
+		toBinaryString(magBytes)
+	);
+}
+
+function decodeBigintSegment(str, offset) {
+	const signByte = str.charCodeAt(offset);
+	const negative = signByte === 0;
+	const rawLengthByte = str.charCodeAt(offset + 1);
+	const length = negative ? 0xff ^ rawLengthByte : rawLengthByte;
+	const start = offset + 2;
+	let magBytes = toBuffer(str.slice(start, start + length));
+	if (negative) magBytes = Buffer.from(magBytes.map((b) => 0xff ^ b));
+	const abs =
+		magBytes.length === 0 ? 0n : BigInt(`0x${magBytes.toString("hex")}`);
+	return { value: negative ? -abs : abs, nextOffset: start + length };
+}
+
+// --- boolean segment: single byte ------------------------------------------
+
+function encodeBooleanSegment(value) {
+	return String.fromCharCode(TAG_BOOLEAN, value ? 1 : 0);
+}
+
+function decodeBooleanSegment(str, offset) {
+	return { value: str.charCodeAt(offset) === 1, nextOffset: offset + 1 };
+}
+
+// --- segment dispatch -------------------------------------------------------
+
+function encodeSegment(segment) {
+	const type = getType(segment);
+	switch (type) {
+		case "string":
+			return encodeStringSegment(segment);
+		case "number":
+			return encodeNumberSegment(segment);
+		case "bigint":
+			return encodeBigintSegment(segment);
+		case "boolean":
+			return encodeBooleanSegment(segment);
+		default:
+			throw new ERR_KVSTORE_INVALID_KEY(
+				"key segments must be a string, number, bigint, or boolean",
+			);
+	}
+}
+
+function decodeSegment(str, offset) {
+	const tag = str.charCodeAt(offset);
+	switch (tag) {
+		case TAG_STRING:
+			return decodeStringSegment(str, offset + 1);
+		case TAG_NUMBER:
+			return decodeNumberSegment(str, offset + 1);
+		case TAG_BIGINT:
+			return decodeBigintSegment(str, offset + 1);
+		case TAG_BOOLEAN:
+			return decodeBooleanSegment(str, offset + 1);
+		default:
+			throw new ERR_KVSTORE_INVALID_KEY(
+				"corrupt key encoding: unknown segment tag",
+			);
+	}
+}
+
 export function serializeKeys(keys) {
-	return keys
-		.map((key) => {
-			const type = getType(key);
-			if (type === "string") {
-				return key;
-			}
-			if (type === "boolean") {
-				return key ? SERIALIZED_CONSTANTS.TRUE : SERIALIZED_CONSTANTS.FALSE;
-			}
-			if (type === "bigint") {
-				return `${key}${SERIALIZED_CONSTANTS.BIGINT_SUFFIX}`;
-			}
-			if (type === "number") {
-				return key;
-			}
-			return String(key);
-		})
-		.join(KEY_PARTS_SEPARATOR);
+	return keys.map(encodeSegment).join("");
 }
 
-// @TODO: memoize this somehow
-export function getSerializedKeyFromRawKey(keys) {
-	return serializeKeys(getSortedKeys(keys));
+export function deserializeKeys(serialized) {
+	const segments = [];
+	let offset = 0;
+	while (offset < serialized.length) {
+		const { value, nextOffset } = decodeSegment(serialized, offset);
+		segments.push(value);
+		offset = nextOffset;
+	}
+	return segments;
 }
 
-export function deserializeKeys(serializedKeys) {
-	return serializedKeys.split(KEY_PARTS_SEPARATOR).map((part) => {
-		if (part === SERIALIZED_CONSTANTS.TRUE) return true;
-		if (part === SERIALIZED_CONSTANTS.FALSE) return false;
-		if (part.endsWith(SERIALIZED_CONSTANTS.BIGINT_SUFFIX))
-			return BigInt(part.slice(0, -1));
-		const num = Number(part);
-		return isNaN(num) ? part : num;
-	});
+/**
+ * Normalize and serialize a raw key in one pass — the entry point for a
+ * *concrete* key (get/set/delete, range bounds, watch key/keys). Requires
+ * at least one segment.
+ * @param {string|Array} rawKey
+ * @returns {{normalized: Array, encoded: string}}
+ */
+export function encodeKey(rawKey) {
+	const normalized = normalizeKeys(rawKey);
+	const encoded = serializeKeys(normalized);
+	if (exceedsKeyByteLimit(encoded)) {
+		throw new ERR_KVSTORE_INVALID_KEY("key exceeds maximum buffer size");
+	}
+	return { normalized, encoded };
+}
+
+/**
+ * Like `encodeKey`, but for a selector's `prefix` field: an empty array is
+ * valid and means "match every key" (see `validatePrefixSegments`).
+ * @param {string|Array} rawPrefix
+ * @returns {{normalized: Array, encoded: string}}
+ */
+export function encodePrefix(rawPrefix) {
+	const normalized = normalizePrefixKeys(rawPrefix);
+	const encoded = serializeKeys(normalized);
+	if (exceedsKeyByteLimit(encoded)) {
+		throw new ERR_KVSTORE_INVALID_SELECTOR(
+			"prefix exceeds maximum buffer size",
+		);
+	}
+	return { normalized, encoded };
+}
+
+/**
+ * Compute the [start, end) bounds of an encoded prefix for sargable range
+ * queries under BLOB memcmp ordering. `end` is `null` when the prefix has
+ * no finite successor (every byte is 0xFF) — callers must treat that as
+ * "no upper bound" rather than binding a literal null-as-value.
+ * @param {string} encodedPrefix
+ * @returns {{start: string, end: string|null}}
+ */
+export function prefixBounds(encodedPrefix) {
+	return {
+		start: encodedPrefix + PREFIX_LOW_MARKER,
+		end: successor(encodedPrefix),
+	};
+}
+
+function successor(str) {
+	for (let i = str.length - 1; i >= 0; i--) {
+		const code = str.charCodeAt(i);
+		if (code < 0xff) {
+			return str.slice(0, i) + String.fromCharCode(code + 1);
+		}
+	}
+	return null;
 }
 
 function isGreater(startKey, endKey) {
-	const encodedStartKey = getSerializedKeyFromRawKey(startKey);
-	const encodedEndKey = getSerializedKeyFromRawKey(endKey);
-	return encodedStartKey > encodedEndKey;
+	return encodeKey(startKey).encoded > encodeKey(endKey).encoded;
 }
 
-function isInPrefix(key, prefix) {
-	const encodedKey = getSerializedKeyFromRawKey(key);
-	const encodedPrefix = getSerializedKeyFromRawKey(prefix);
+function isInPrefix(key, encodedPrefix) {
+	const encodedKey = encodeKey(key).encoded;
 	return (
 		encodedKey.startsWith(encodedPrefix) &&
 		encodedKey.length > encodedPrefix.length
 	);
 }
 
+// Presence checks below use `!== undefined`, not truthiness — `""` is a
+// falsy-but-valid KeyValue (shorthand for a single empty-string segment,
+// which is itself invalid and must fail with a clear "empty string segment"
+// error from encodePrefix/encodeKey, not be silently treated as "absent").
 function validateSelectorKeys(selector) {
 	if (!selector || typeof selector !== "object") {
-		throw new Error(KEY_SELECTOR_INVALID);
+		throw new ERR_KVSTORE_INVALID_SELECTOR("Invalid key selector");
 	}
-	if (selector.prefix) {
-		if (selector.start && selector.end) {
-			throw new Error(KEY_SELECTOR_RANGE_INVALID);
+	if (selector.prefix !== undefined) {
+		const { encoded: encodedPrefix } = encodePrefix(selector.prefix);
+		if (
+			selector.start !== undefined &&
+			!isInPrefix(selector.start, encodedPrefix)
+		) {
+			throw new ERR_KVSTORE_INVALID_SELECTOR(
+				"Start key is not in the key space defined by prefix",
+			);
 		}
-		if (selector.start && !isInPrefix(selector.start, selector.prefix)) {
-			throw new Error(KEY_SELECTOR_RANGE_START_NOT_IN_PREFIX);
+		if (
+			selector.end !== undefined &&
+			!isInPrefix(selector.end, encodedPrefix)
+		) {
+			throw new ERR_KVSTORE_INVALID_SELECTOR(
+				"End key is not in the key space defined by prefix",
+			);
 		}
-		if (selector.end && !isInPrefix(selector.end, selector.prefix)) {
-			throw new Error(KEY_SELECTOR_RANGE_END_NOT_IN_PREFIX);
+		if (
+			selector.start !== undefined &&
+			selector.end !== undefined &&
+			isGreater(selector.start, selector.end)
+		) {
+			throw new ERR_KVSTORE_INVALID_SELECTOR(
+				"Start key is greater than end key",
+			);
 		}
-		validateKeys(selector.prefix);
 		return;
 	}
-	if (!selector.start || !selector.end) {
-		throw new Error(KEY_SELECTOR_RANGE_INVALID);
+	if (selector.start === undefined || selector.end === undefined) {
+		throw new ERR_KVSTORE_INVALID_SELECTOR(
+			"Range selector requires both start and end keys",
+		);
 	}
 	if (isGreater(selector.start, selector.end)) {
-		throw new Error(KEY_SELECTOR_RANGE_START_OVER_END);
+		throw new ERR_KVSTORE_INVALID_SELECTOR("Start key is greater than end key");
 	}
 }
 
-export function findBySelector(selector, options, db) {
+export function findBySelector(selector, db) {
 	validateSelectorKeys(selector);
-	if (!selector.prefix) {
-		return db.range(serializeKeys(selector.start), serializeKeys(selector.end));
+	if (selector.prefix === undefined) {
+		return db.range(
+			encodeKey(selector.start).encoded,
+			encodeKey(selector.end).encoded,
+		);
 	}
-	const iterator = db.prefix(serializeKeys(selector.prefix), {
-		start: selector.start != null ? serializeKeys(selector.start) : undefined,
-		end: selector.end != null ? serializeKeys(selector.end) : undefined,
+	const { encoded: encodedPrefix } = encodePrefix(selector.prefix);
+	return db.prefix(encodedPrefix, {
+		start:
+			selector.start != null ? encodeKey(selector.start).encoded : undefined,
+		end: selector.end != null ? encodeKey(selector.end).encoded : undefined,
 	});
-	return iterator;
 }

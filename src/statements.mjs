@@ -1,95 +1,179 @@
-import { KEY_PARTS_SEPARATOR } from "./constants.mjs";
-import { deserializeKeys } from "./keys.mjs";
+import { MAX_IN_CLAUSE_VARIABLES, TABLE_NAME } from "./constants.mjs";
+import { deserializeKeys, prefixBounds } from "./keys.mjs";
 import { deserializeValue, serializeValue } from "./utils.mjs";
 
 /**
  * @typedef {Object} DbInstance
  */
 
+function toBlob(binaryString) {
+	return Buffer.from(binaryString, "latin1");
+}
+
+function fromBlob(value) {
+	return Buffer.from(value).toString("latin1");
+}
+
 /**
- * Prepare a custom DB interface
+ * Pool of prepared statements for one fixed SQL text. `range()`/`prefix()`
+ * need a statement each has exclusive use of for the lifetime of its
+ * `.iterate()` cursor (a single sqlite3_stmt can only have one active
+ * execution at a time — see the pool usage below), so concurrent/interleaved
+ * iterators must never share one. Sequential calls, the common case, reuse a
+ * released statement instead of recompiling identical SQL every time.
+ */
+function makeStatementPool(database, sql) {
+	const idle = [];
+	return {
+		acquire: () => idle.pop() ?? database.prepare(sql),
+		release: (stmt) => idle.push(stmt),
+	};
+}
+
+/**
+ * Prepare a custom DB interface backed by a fixed table name. Keys are
+ * stored as BLOB (memcmp comparison, no text-encoding re-interpretation) so
+ * the order-preserving key encoding in keys.mjs sorts exactly as designed.
  * @param {DatabaseSync} database
- * @param {string} namespace
+ * @param {{isMemory: boolean}} options
  * @returns {DbInstance}
  */
-export function prepareDb(database, namespace) {
+export function prepareDb(database, { isMemory } = {}) {
+	// WAL + NORMAL synchronous is always-on for file-backed stores (never for
+	// :memory:, where journaling is irrelevant). This creates `-wal`/`-shm`
+	// sidecar files next to the database file while it's open.
+	if (!isMemory) {
+		database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+	}
+
 	database.exec(`
-  CREATE TABLE IF NOT EXISTS ${namespace} (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  )`);
+	  CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
+	    key BLOB PRIMARY KEY,
+	    value BLOB
+	  )`);
 
 	const upsertStm = database.prepare(
-		`INSERT INTO ${namespace} (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		`INSERT INTO ${TABLE_NAME} (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 	);
 
 	const selectStm = database.prepare(
-		`SELECT value FROM ${namespace} WHERE key = :key`,
+		`SELECT value FROM ${TABLE_NAME} WHERE key = :key`,
 	);
 
 	const deleteStm = database.prepare(
-		`DELETE FROM ${namespace} WHERE key = :key`,
+		`DELETE FROM ${TABLE_NAME} WHERE key = :key`,
 	);
 
-	const prefixStm = database.prepare(
-		`SELECT key FROM ${namespace} WHERE key LIKE :prefix`,
-	);
+	const clearStm = database.prepare(`DELETE FROM ${TABLE_NAME}`);
 
-	const rangeStm = database.prepare(
-		`SELECT key FROM ${namespace} WHERE key >= :start AND key <= :end`,
-	);
+	// range/prefix use `.iterate()`, which holds a live cursor on the
+	// underlying prepared statement — see `makeStatementPool` above for why
+	// each iteration pass needs its own statement.
+	const rangeSql = `SELECT key, value FROM ${TABLE_NAME} WHERE key >= :start AND key <= :end`;
+	const prefixSql = `SELECT key, value FROM ${TABLE_NAME}
+		 WHERE key >= :prefixStart AND (:prefixEnd IS NULL OR key < :prefixEnd)
+		   AND (:start IS NULL OR key >= :start)
+		   AND (:end   IS NULL OR key <= :end)`;
+	const rangePool = makeStatementPool(database, rangeSql);
+	const prefixPool = makeStatementPool(database, prefixSql);
 
-	const flushStm = database.prepare(`DELETE FROM ${namespace}`);
+	// getMany's chunk statements have no live cursor (each is a single .all()
+	// call, not .iterate()), so — unlike range/prefix — they can be cached
+	// outright, keyed by chunk length, with no concurrency caveat.
+	const inClauseStatements = new Map();
+	function getInClauseStatement(count) {
+		let stmt = inClauseStatements.get(count);
+		if (!stmt) {
+			const placeholders = Array(count).fill("?").join(", ");
+			stmt = database.prepare(
+				`SELECT key, value FROM ${TABLE_NAME} WHERE key IN (${placeholders})`,
+			);
+			inClauseStatements.set(count, stmt);
+		}
+		return stmt;
+	}
+
+	function* mapEntries(rows) {
+		for (const entry of rows) {
+			yield { key: deserializeKeys(fromBlob(entry.key)) };
+		}
+	}
 
 	return {
-		tables: () => {
-			return database.exec(`SELECT * FROM sqlite_master;`);
-		},
 		upsert: (serializedKey, value) => {
 			const serializedValue = serializeValue(value);
-			return upsertStm.run(serializedKey, serializedValue);
+			upsertStm.run(toBlob(serializedKey), serializedValue);
+			return serializedValue;
 		},
 		get: (serializedKey) => {
-			const entry = selectStm.get({ key: serializedKey });
-			if (entry) {
-				return { key: serializedKey, value: deserializeValue(entry.value) };
+			const entry = selectStm.get({ key: toBlob(serializedKey) });
+			return entry ? { value: deserializeValue(entry.value) } : { value: null };
+		},
+		getMany: (serializedKeys) => {
+			const byKey = new Map();
+			if (serializedKeys.length === 0) return byKey;
+			// BLOB keys can't round-trip through json_each (JSON has no binary
+			// type, and SQLite never treats a TEXT value as equal to a BLOB one
+			// regardless of column affinity) — build parameterized IN(...) lists
+			// instead, chunked to stay under SQLITE_MAX_VARIABLE_NUMBER.
+			for (
+				let offset = 0;
+				offset < serializedKeys.length;
+				offset += MAX_IN_CLAUSE_VARIABLES
+			) {
+				const chunk = serializedKeys.slice(
+					offset,
+					offset + MAX_IN_CLAUSE_VARIABLES,
+				);
+				const stmt = getInClauseStatement(chunk.length);
+				const rows = stmt.all(...chunk.map(toBlob));
+				for (const row of rows) {
+					byKey.set(fromBlob(row.key), deserializeValue(row.value));
+				}
 			}
-			return { key: serializedKey, value: null };
+			return byKey;
 		},
 		delete: (serializedKey) => {
-			return deleteStm.run({ key: serializedKey });
+			return deleteStm.run({ key: toBlob(serializedKey) });
 		},
-		flush: () => {
-			flushStm.run();
+		clear: () => {
+			clearStm.run();
 		},
 		range: (serializedStart, serializedEnd) => {
-			const iterator = rangeStm.iterate({
-				start: serializedStart,
-				end: serializedEnd,
-			});
+			const params = {
+				start: toBlob(serializedStart),
+				end: toBlob(serializedEnd),
+			};
+			// A statement is acquired only when iteration actually starts (not
+			// here, at range() call time) and released once this pass is fully
+			// consumed, so the returned object stays a true re-iterable and
+			// concurrent/interleaved iterators still never share one statement.
 			return {
 				*[Symbol.iterator]() {
-					for (const entry of iterator) {
-						yield { key: deserializeKeys(entry.key) };
+					const stmt = rangePool.acquire();
+					try {
+						yield* mapEntries(stmt.iterate(params));
+					} finally {
+						rangePool.release(stmt);
 					}
 				},
 			};
 		},
 		prefix: (serializedPrefix, options) => {
-			// Mind to add a key separator to avoid partial matching for prefix
-			const iterator = prefixStm.iterate({
-				prefix: `${serializedPrefix}${KEY_PARTS_SEPARATOR}%`,
-			});
+			const bounds = prefixBounds(serializedPrefix);
+			const params = {
+				prefixStart: toBlob(bounds.start),
+				prefixEnd: bounds.end != null ? toBlob(bounds.end) : null,
+				start: options.start != null ? toBlob(options.start) : null,
+				end: options.end != null ? toBlob(options.end) : null,
+			};
 			return {
 				*[Symbol.iterator]() {
-					for (const entry of iterator) {
-						const isPurePrefix = options.start == null && options.end == null;
-						const isWithinStart =
-							options.start != null && entry.key >= options.start;
-						const isWithinEnd = options.end != null && entry.key <= options.end;
-						if (isPurePrefix || isWithinStart || isWithinEnd) {
-							yield { key: deserializeKeys(entry.key) };
-						}
+					const stmt = prefixPool.acquire();
+					try {
+						yield* mapEntries(stmt.iterate(params));
+					} finally {
+						prefixPool.release(stmt);
 					}
 				},
 			};

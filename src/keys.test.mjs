@@ -1,8 +1,24 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { getSortedKeys } from "./keys.mjs";
+import { TAG_STRING } from "./constants.mjs";
+import {
+	deserializeKeys,
+	encodeKey,
+	encodePrefix,
+	normalizeKeys,
+	serializeKeys,
+} from "./keys.mjs";
 
-describe("getSortedKeys", () => {
+function sortByEncoded(values) {
+	return [...values]
+		.map((v) => ({ v, encoded: serializeKeys(normalizeKeys([v])) }))
+		.sort((a, b) =>
+			a.encoded < b.encoded ? -1 : a.encoded > b.encoded ? 1 : 0,
+		)
+		.map((e) => e.v);
+}
+
+describe("normalizeKeys", () => {
 	it("should not throw for valid keys", () => {
 		const validKeys = [
 			// string based keys
@@ -12,7 +28,7 @@ describe("getSortedKeys", () => {
 			// number based keys
 			[8],
 			[8, 8],
-			[NaN, -NaN, Infinity, -Infinity],
+			[Infinity, -Infinity],
 			// bigInt based keys
 			[8n],
 			[8n, 8n],
@@ -22,9 +38,12 @@ describe("getSortedKeys", () => {
 			[true, false],
 			[true, true],
 			[false, false],
+			// whitespace-only string segments are allowed — only "" is rejected
+			[" "],
+			["\t\n"],
 		];
 		for (const validKey of validKeys) {
-			assert.doesNotThrow(() => getSortedKeys(validKey));
+			assert.doesNotThrow(() => normalizeKeys(validKey));
 		}
 	});
 
@@ -35,23 +54,267 @@ describe("getSortedKeys", () => {
 			["null", "undefined", "Infinity", "NaN", "true", "false", "🤷", "康"],
 		];
 		for (const validKey of validKeys) {
-			assert.doesNotThrow(() => getSortedKeys(validKey));
+			assert.doesNotThrow(() => normalizeKeys(validKey));
 		}
 	});
 
-	it("should throw for invalid keys", () => {
-		const invalidKeys = [
-			// string based keys
-			[undefined],
-			[null],
-			[Symbol()],
-			[{}],
-			[() => {}],
-			// over max bytes size (> 1024 b)
-			Array(210).fill("hello"),
-		];
+	it("should throw ERR_KVSTORE_INVALID_KEY for an empty array", () => {
+		assert.throws(() => normalizeKeys([]), {
+			name: "TypeError",
+			code: "ERR_KVSTORE_INVALID_KEY",
+		});
+	});
+
+	it("should throw ERR_KVSTORE_INVALID_KEY for an empty string segment", () => {
+		assert.throws(() => normalizeKeys([""]), {
+			name: "TypeError",
+			code: "ERR_KVSTORE_INVALID_KEY",
+		});
+	});
+
+	it("should throw for NaN — it cannot compare equal to itself as a key", () => {
+		assert.throws(() => normalizeKeys([NaN]), {
+			name: "TypeError",
+			code: "ERR_KVSTORE_INVALID_KEY",
+		});
+	});
+
+	it("should throw for invalid segment types", () => {
+		const invalidKeys = [[undefined], [null], [Symbol()], [{}], [() => {}]];
 		for (const invalidKey of invalidKeys) {
-			assert.throws(() => getSortedKeys(invalidKey));
+			assert.throws(() => normalizeKeys(invalidKey), {
+				name: "TypeError",
+				code: "ERR_KVSTORE_INVALID_KEY",
+			});
 		}
+	});
+
+	it("should throw ERR_KVSTORE_INVALID_KEY when the raw key itself isn't a string or array (regression: coverage gap)", () => {
+		for (const raw of [null, undefined, 42, true, {}, Symbol()]) {
+			assert.throws(
+				() => normalizeKeys(raw),
+				(err) => {
+					assert.ok(err instanceof TypeError);
+					assert.equal(err.code, "ERR_KVSTORE_INVALID_KEY");
+					assert.match(err.message, /key must be an array of segments/);
+					return true;
+				},
+			);
+		}
+	});
+
+	it("encodeKey should throw when the encoded form exceeds 1024 bytes", () => {
+		assert.throws(() => encodeKey(Array(210).fill("hello")), {
+			name: "TypeError",
+			code: "ERR_KVSTORE_INVALID_KEY",
+		});
+	});
+
+	it("encodeKey should throw ERR_KVSTORE_BIGINT_TOO_LARGE for an oversized bigint", () => {
+		const huge = 2n ** 2100n; // > 255 bytes of magnitude
+		assert.throws(() => encodeKey([huge]), {
+			name: "RangeError",
+			code: "ERR_KVSTORE_BIGINT_TOO_LARGE",
+		});
+	});
+});
+
+describe("encodePrefix", () => {
+	it("accepts an empty array — matches every key", () => {
+		assert.doesNotThrow(() => encodePrefix([]));
+		assert.equal(encodePrefix([]).encoded, "");
+	});
+
+	it("still rejects an empty string segment", () => {
+		assert.throws(() => encodePrefix([""]), {
+			name: "TypeError",
+			code: "ERR_KVSTORE_INVALID_SELECTOR",
+		});
+	});
+
+	it("still rejects NaN", () => {
+		assert.throws(() => encodePrefix([NaN]), {
+			name: "TypeError",
+			code: "ERR_KVSTORE_INVALID_SELECTOR",
+		});
+	});
+
+	it("should throw ERR_KVSTORE_INVALID_SELECTOR when the raw prefix itself isn't a string or array (regression: coverage gap)", () => {
+		for (const raw of [null, undefined, 42, true, {}]) {
+			assert.throws(
+				() => encodePrefix(raw),
+				(err) => {
+					assert.ok(err instanceof TypeError);
+					assert.equal(err.code, "ERR_KVSTORE_INVALID_SELECTOR");
+					assert.match(err.message, /prefix must be an array of segments/);
+					return true;
+				},
+			);
+		}
+	});
+
+	it("should throw when the encoded prefix form exceeds 1024 bytes (regression: coverage gap)", () => {
+		assert.throws(() => encodePrefix(Array(210).fill("hello")), {
+			name: "TypeError",
+			code: "ERR_KVSTORE_INVALID_SELECTOR",
+		});
+	});
+});
+
+describe("malformed input at the encode/decode layer (bypassing normalizeKeys' validation — regression: coverage gap)", () => {
+	it("serializeKeys rejects NaN even when called directly, without normalizeKeys", () => {
+		assert.throws(
+			() => serializeKeys([NaN]),
+			(err) => {
+				assert.ok(err instanceof TypeError);
+				assert.equal(err.code, "ERR_KVSTORE_INVALID_KEY");
+				assert.match(err.message, /NaN is not a valid key segment/);
+				return true;
+			},
+		);
+	});
+
+	it("serializeKeys rejects an unsupported segment type even when called directly", () => {
+		for (const bad of [undefined, null, {}, Symbol(), () => {}]) {
+			assert.throws(
+				() => serializeKeys([bad]),
+				(err) => {
+					assert.ok(err instanceof TypeError);
+					assert.equal(err.code, "ERR_KVSTORE_INVALID_KEY");
+					assert.match(
+						err.message,
+						/key segments must be a string, number, bigint, or boolean/,
+					);
+					return true;
+				},
+			);
+		}
+	});
+
+	it("deserializeKeys throws on a truncated string segment", () => {
+		const truncated = `${String.fromCharCode(TAG_STRING)}abc`; // no terminator
+		assert.throws(
+			() => deserializeKeys(truncated),
+			(err) => {
+				assert.ok(err instanceof TypeError);
+				assert.equal(err.code, "ERR_KVSTORE_INVALID_KEY");
+				assert.match(err.message, /truncated string segment/);
+				return true;
+			},
+		);
+	});
+
+	it("deserializeKeys throws on an unrecognized segment tag", () => {
+		const corrupt = String.fromCharCode(0x09); // not any real TAG_* value
+		assert.throws(
+			() => deserializeKeys(corrupt),
+			(err) => {
+				assert.ok(err instanceof TypeError);
+				assert.equal(err.code, "ERR_KVSTORE_INVALID_KEY");
+				assert.match(err.message, /unknown segment tag/);
+				return true;
+			},
+		);
+	});
+});
+
+describe("serializeKeys / deserializeKeys round-trip", () => {
+	const fixtures = [
+		["plain string"],
+		["multi", "segment"],
+		[42],
+		[42n],
+		[true, false],
+		// numeric strings must not collide with numbers
+		["5"],
+		["5n"],
+		// strings containing the new terminator byte (U+0000) — must be escaped
+		["foo\x00bar"],
+		// strings containing the new escape byte (U+0001) — must round-trip too
+		["foo\x01bar"],
+		// adjacent escape + terminator
+		["\x01\x00"],
+		// the bytes used by the *old* text-based encoding scheme, to prove
+		// they are now ordinary content with no special meaning
+		["foo\x1Fbar", "foo\x1Ebar"],
+		// unicode
+		["🤷", "康"],
+		// mixed types in one key
+		[false, "a", 1, 2n],
+		// edge numbers, including negatives and -0
+		[Number.MAX_SAFE_INTEGER, Infinity, -Infinity, -0, 0, -1.5, 1.5],
+		// bigints spanning sign and magnitude-length boundaries
+		[0n, -1n, 1n, -255n, 255n, 256n, -256n],
+	];
+
+	for (const fixture of fixtures) {
+		it(`round-trips ${JSON.stringify(fixture, (_, v) => (typeof v === "bigint" ? `${v}n` : v))}`, () => {
+			const normalized = normalizeKeys(fixture);
+			const round = deserializeKeys(serializeKeys(normalized));
+			// -0 normalizes to 0 by design (see the float64 encoding in keys.mjs).
+			const expected = normalized.map((v) => (Object.is(v, -0) ? 0 : v));
+			assert.deepEqual(round, expected);
+		});
+	}
+
+	it("distinguishes [5] from ['5']", () => {
+		assert.notStrictEqual(
+			serializeKeys(normalizeKeys([5])),
+			serializeKeys(normalizeKeys(["5"])),
+		);
+	});
+
+	it("distinguishes [true] from ['true']", () => {
+		assert.notStrictEqual(
+			serializeKeys(normalizeKeys([true])),
+			serializeKeys(normalizeKeys(["true"])),
+		);
+	});
+
+	it("distinguishes 1 (number) from 1n (bigint) — never coerced together", () => {
+		assert.notStrictEqual(
+			serializeKeys(normalizeKeys([1])),
+			serializeKeys(normalizeKeys([1n])),
+		);
+	});
+
+	it("-0 encodes identically to 0", () => {
+		assert.equal(
+			serializeKeys(normalizeKeys([-0])),
+			serializeKeys(normalizeKeys([0])),
+		);
+	});
+});
+
+describe("order-preserving encoding", () => {
+	it("sorts numbers numerically, not lexicographically", () => {
+		const values = [1, 2, 3, 9, 10, 11, 20, 100, -1, -300, -3, 0, 1.5, -1.5];
+		const expected = [...values].sort((a, b) => a - b);
+		assert.deepEqual(sortByEncoded(values), expected);
+	});
+
+	it("sorts bigints numerically across sign and magnitude-length boundaries", () => {
+		const values = [0n, -1n, 1n, -255n, 255n, 256n, -256n, 5n, -5n];
+		const expected = [...values].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+		assert.deepEqual(sortByEncoded(values), expected);
+	});
+
+	it("sorts strings by UTF-8 byte order", () => {
+		const values = ["b", "a", "ab", "abc"];
+		assert.deepEqual(sortByEncoded(values), ["a", "ab", "abc", "b"]);
+	});
+
+	it("sorts booleans false < true", () => {
+		assert.deepEqual(sortByEncoded([true, false]), [false, true]);
+	});
+
+	it("cross-type order is string < number < bigint < boolean", () => {
+		assert.deepEqual(sortByEncoded([true, 1n, 1, "a"]), ["a", 1, 1n, true]);
+	});
+
+	it("Infinity/-Infinity sort at the extremes of the number bucket", () => {
+		const values = [Infinity, 0, -Infinity, 100, -100];
+		const expected = [-Infinity, -100, 0, 100, Infinity];
+		assert.deepEqual(sortByEncoded(values), expected);
 	});
 });

@@ -1,18 +1,22 @@
 import EventEmitter from "node:events";
 import { DatabaseSync } from "node:sqlite";
 import { Readable } from "node:stream";
-import { DATABASE_IS_CLOSED } from "./errors.mjs";
-import { getValueForKeys, getValuesForMultipleKeys } from "./get.mjs";
-import { findBySelector, getSerializedKeyFromRawKey } from "./keys.mjs";
-import { setValueForKeys } from "./set.mjs";
+import {
+	ERR_KVSTORE_CLOSED,
+	ERR_KVSTORE_INVALID_KEYS,
+	ERR_KVSTORE_INVALID_SELECTOR,
+	ERR_KVSTORE_INVALID_TOPIC,
+} from "./errors.mjs";
+import {
+	encodeKey,
+	encodePrefix,
+	findBySelector,
+	prefixBounds,
+} from "./keys.mjs";
 import { prepareDb } from "./statements.mjs";
+import { deserializeValue } from "./utils.mjs";
 
 const IN_MEMORY_DB = ":memory:";
-const DB_NAME = "mydb.sqlite";
-const DEFAULT_NAMESPACE = "kvlite";
-
-// delay the opening of the database
-const database = new DatabaseSync(DB_NAME, { open: false });
 
 /**
  * A key made of either a single string, or a list of a string, number, bigint or boolean values.
@@ -31,9 +35,10 @@ const database = new DatabaseSync(DB_NAME, { open: false });
 
 /**
  * @typedef {Object} PrefixSelector
- * @property {KeyValue} prefix The prefix for the entry, it can specify a starting or ending given key.
- * @property {KeyValue} start The start of the range for the entry.
- * @property {KeyValue} end The end of the range for the entry.
+ * @property {KeyValue} prefix The prefix for the entry. An empty array (`[]`)
+ *   matches every key in the store.
+ * @property {KeyValue} [start] Optional start bound within the prefix.
+ * @property {KeyValue} [end] Optional end bound within the prefix.
  */
 
 /**
@@ -41,199 +46,355 @@ const database = new DatabaseSync(DB_NAME, { open: false });
  * @typedef {PrefixSelector|RangeSelector} KeySelector
  */
 
-class KVLite {
-	#closed;
+const VALID_KEY_EVENTS = new Set(["set", "delete", "clear"]);
+const KEY_CHANGED = "keyChanged";
+const DEFAULT_SUB_HIGHWATERMARK = 1024;
+const SELECTOR_SHAPE_MESSAGE =
+	"watch selector must be exactly one of { key }, { keys }, { prefix }, or { topic }";
 
+function assertValidTopic(topic, ErrorClass) {
+	if (typeof topic !== "string" || topic.length === 0) {
+		throw new ErrorClass("topic must be a non-empty string");
+	}
+}
+
+class KVStore {
+	#closed = false;
+	#database;
 	#statements;
-	#keysListener;
+	#keyEmitter = new EventEmitter();
+	#topicEmitter = new EventEmitter();
+	#subscriptions = new Set();
 
 	/**
 	 * Create a new instance of a Key Value database.
-	 * @param {string} namespace - The namespace used for the database. Default: ${DEFAULT_NAMESPACE}
+	 * @param {{path?: string}} [options]
+	 *   - `path` (default: in-memory): on-disk database file. When omitted,
+	 *     the store is ephemeral (`:memory:`) — `openKv()` with no arguments
+	 *     has no disk side effect.
 	 */
-	constructor(namespace = DEFAULT_NAMESPACE) {
-		this.#closed = false;
+	constructor(options = {}) {
+		const { path } = options;
+		const isMemory = path === undefined;
 
-		// open the connection now
-		database.open();
-
-		// prepare the statements for later usage
-		this.#statements = prepareDb(database, namespace);
-
-		this.#keysListener = new EventEmitter();
+		this.#database = new DatabaseSync(isMemory ? IN_MEMORY_DB : path);
+		this.#statements = prepareDb(this.#database, { isMemory });
+		// Every watch() call adds one listener to these shared emitters — that's
+		// the normal, expected shape of the public API (many independent
+		// watchers on the same store), not a leak, so the default cap of 10
+		// would otherwise print a spurious MaxListenersExceededWarning.
+		this.#keyEmitter.setMaxListeners(0);
+		this.#topicEmitter.setMaxListeners(0);
 	}
 
 	#assertIsNotClosed() {
 		if (this.#closed) {
-			throw new Error(DATABASE_IS_CLOSED);
+			throw new ERR_KVSTORE_CLOSED("Database is closed");
 		}
-	}
-
-	#watchedKeys = new Set();
-
-	#addKeysToWatcher(manyKeys) {
-		for (const keys of manyKeys) {
-			const serializedKey = getSerializedKeyFromRawKey(keys);
-			this.#watchedKeys.add(serializedKey);
-		}
-	}
-
-	#removeKeysFromWatcher(manyKeys) {
-		for (const keys of manyKeys) {
-			const serializedKey = getSerializedKeyFromRawKey(keys);
-			this.#watchedKeys.delete(serializedKey);
-		}
-	}
-
-	#isKeyWatched(keys) {
-		const serializedKey = getSerializedKeyFromRawKey(keys);
-		return this.#watchedKeys.has(serializedKey);
 	}
 
 	/**
-	 * Close the connection to the database.
-	 * If the connection is already closed, this method does nothing.
+	 * Close the connection to the database. Idempotent.
 	 * @returns {void}
 	 */
 	close() {
 		if (!this.#closed) {
-			// do not blow it up if closed already in this case
-			database.close();
+			this.#database.close();
 			this.#closed = true;
-			this.#watchedKeys.clear();
+			this.#keyEmitter.removeAllListeners();
+			this.#topicEmitter.removeAllListeners();
+			for (const stream of this.#subscriptions) stream.push(null);
+			this.#subscriptions.clear();
 		}
 	}
 
 	/**
 	 * Delete the value associated with the given key.
-	 * If there's no value associated with the given key, this method does nothing.
-	 * @param {KeyValue} keys - The key to delete
-	 * @returns {boolean} True if the key was deleted, false otherwise.
+	 * @param {KeyValue} key
+	 * @returns {boolean} `true` if a row was removed, `false` if no row matched.
 	 */
-	delete(keys) {
+	delete(key) {
 		this.#assertIsNotClosed();
-		const serializedKey = getSerializedKeyFromRawKey(keys);
-		const ret = this.#statements.delete(serializedKey);
-		return ret.changes > 0;
+		const { normalized, encoded } = encodeKey(key);
+		const removed = this.#statements.delete(encoded).changes > 0;
+		if (removed) {
+			this.#keyEmitter.emit(KEY_CHANGED, {
+				type: "delete",
+				encodedKey: encoded,
+				normalizedKey: normalized,
+			});
+		}
+		return removed;
 	}
 
 	/**
 	 * Delete all the keys in the database.
 	 * @returns {void}
 	 */
-	flush() {
+	clear() {
 		this.#assertIsNotClosed();
-		this.#statements.flush();
+		this.#statements.clear();
+		this.#keyEmitter.emit(KEY_CHANGED, { type: "clear" });
 	}
 
 	/**
 	 * Retrieve the value associated with the given key.
-	 * If no value exists for the given key, the returned entry will have a `null` value.
-	 * @param {KeyValue} key - The key used to retrieve
-	 * @param {*} options
-	 * @returns {EntryValue} The entry associated with the given key.
+	 *
+	 * Note: a `null` value is returned both when the key is absent and when
+	 * the stored value genuinely is `null` — there is no way to distinguish
+	 * the two in 1.0. A future `versionstamp` return (tracked for 1.x) would
+	 * resolve this.
+	 * @param {KeyValue} key
+	 * @returns {EntryValue}
 	 */
-	get(key, options) {
+	get(key) {
 		this.#assertIsNotClosed();
-		return getValueForKeys(key, options, this.#statements);
+		const { normalized, encoded } = encodeKey(key);
+		const row = this.#statements.get(encoded);
+		return { key: normalized, value: row.value };
 	}
 
 	/**
 	 * Retrieve the values associated with the given keys.
-	 * The returned array will have the same length as the `keys` array and the entries
-	 * will be in the same order as the keys.
-	 * If no value exists for the given key, the returned entry will have a `null` value.
-	 * @param {KeyValue[]} manyKeys - The keys used to retrieve
-	 * @param {*} options
-	 * @returns {EntryValue[]} The entries associated with the given keys.
+	 * The returned array preserves the order of the input keys.
+	 * @param {KeyValue[]} manyKeys
+	 * @returns {EntryValue[]}
 	 */
-	getMany(manyKeys, options) {
+	getMany(manyKeys) {
 		this.#assertIsNotClosed();
-		return getValuesForMultipleKeys(manyKeys, options, this.#statements);
+		if (!Array.isArray(manyKeys)) {
+			throw new ERR_KVSTORE_INVALID_KEYS("manyKeys must be an array");
+		}
+		if (manyKeys.length < 1) {
+			throw new ERR_KVSTORE_INVALID_KEYS("manyKeys must have at least one key");
+		}
+		const encoded = new Array(manyKeys.length);
+		const normalized = new Array(manyKeys.length);
+		for (let i = 0; i < manyKeys.length; i++) {
+			const k = encodeKey(manyKeys[i]);
+			encoded[i] = k.encoded;
+			normalized[i] = k.normalized;
+		}
+		const byKey = this.#statements.getMany(encoded);
+		const result = new Array(manyKeys.length);
+		for (let i = 0; i < manyKeys.length; i++) {
+			result[i] = {
+				key: normalized[i],
+				value: byKey.has(encoded[i]) ? byKey.get(encoded[i]) : null,
+			};
+		}
+		return result;
 	}
 
 	/**
 	 * Retrieve the keys associated with the given selector.
-	 * @param {KeySelector} selector - The selector used to retrieve keys.
-	 * @param {*} options
-	 * @returns {Iterator} An iterator over the keys associated with the given selector
+	 * @param {KeySelector} selector
+	 * @returns {Iterable<{key: KeyValue}>}
 	 */
-	keys(selector, options) {
+	keys(selector) {
 		this.#assertIsNotClosed();
-		return findBySelector(selector, options, this.#statements);
+		return findBySelector(selector, this.#statements);
 	}
 
 	/**
-	 * Set the value associated with the given key.
-	 * @param {KeyValue} key - The key to set
-	 * @param {*} value - The value to associate with the key
-	 * @param {*} options
-	 * @returns {boolean} True if the key was set, false otherwise.
+	 * Set the value associated with the given key. Throws on error; does not
+	 * return a value — a `{ ok }` envelope would be misleading under SQLite
+	 * UPSERT semantics, where a no-op write of an identical value also
+	 * reports zero changed rows.
+	 *
+	 * Watchers observe a fresh clone of `value` (same v8 structured-clone
+	 * codec used for storage), not the reference passed in — consistent with
+	 * `get()` and immune to the caller mutating `value` after this returns.
+	 * @param {KeyValue} key
+	 * @param {*} value - any value supported by the v8 structured-clone codec
+	 *   (see utils.mjs `serializeValue`), including `BigInt` and `undefined`.
+	 * @returns {void}
 	 */
-	set(key, value, options) {
+	set(key, value) {
 		this.#assertIsNotClosed();
-		const ret = setValueForKeys(key, value, options, this.#statements);
-		const serializedKey = getSerializedKeyFromRawKey(key);
-		if (ret.ok && this.#isKeyWatched(serializedKey)) {
-			console.log("emitting key", serializedKey);
-			this.#keysListener.emit(serializedKey, value);
+		const { normalized, encoded } = encodeKey(key);
+		const serializedValue = this.#statements.upsert(encoded, value);
+		if (this.#keyEmitter.listenerCount(KEY_CHANGED) > 0) {
+			this.#keyEmitter.emit(KEY_CHANGED, {
+				type: "set",
+				encodedKey: encoded,
+				normalizedKey: normalized,
+				value: deserializeValue(serializedValue),
+			});
 		}
-		return ret;
 	}
 
 	/**
-	 * Watch for changes to the given keys.
-	 * @param {KeyValue} keys - The keys to watch
-	 * @param {*} options
-	 * @returns {ReadableStream} A readable stream that emits changes to the keys.
+	 * Watch for changes on the store or for messages on a custom topic.
+	 *
+	 * Selector forms (mutually exclusive):
+	 *   { key }    — fires on set/delete of that exact key (and on clear)
+	 *   { keys }   — fires on set/delete of any of the listed exact keys (and on clear)
+	 *   { prefix } — fires on set/delete of any key under prefix (and on clear)
+	 *   { topic }  — fires on kv.publish(topic, payload)
+	 *
+	 * Optional `events` filter (key/keys/prefix only): array of 'set' | 'delete' | 'clear'.
+	 *
+	 * Backpressure: if a watcher's buffer reaches `highWaterMark`, intervening
+	 * events are dropped and a single `{type:'lag', dropped}` event is delivered
+	 * once the buffer drains again.
+	 *
+	 * Key/keys/prefix streams emit:
+	 *   { type:'set',    key, value }
+	 *   { type:'delete', key }
+	 *   { type:'clear' }
+	 *   { type:'lag',    dropped }
+	 *
+	 * Topic streams emit the published payload directly (no envelope).
+	 *
+	 * @param {{key?: any, keys?: any[], prefix?: any, topic?: string, events?: string[]}} selector
+	 * @param {{highWaterMark?: number}} [options]
+	 * @returns {Readable} object-mode stream emitting one event per push.
 	 */
-	watch(keys, options) {
+	watch(selector, options = {}) {
 		this.#assertIsNotClosed();
-		this.#addKeysToWatcher(keys);
-		const listeners = [];
+		const { highWaterMark = DEFAULT_SUB_HIGHWATERMARK } = options;
+		if (!(highWaterMark >= 1)) {
+			throw new ERR_KVSTORE_INVALID_SELECTOR("highWaterMark must be >= 1");
+		}
+		const { predicate, kind } = this.#compileSelector(selector);
+		const eventFilter = this.#compileEventFilter(selector.events);
 
-		const ac = new AbortController();
+		const stream = new Readable({ objectMode: true, highWaterMark, read() {} });
+		this.#subscriptions.add(stream);
 
-		const values = new WeakMap();
+		let dropped = 0;
+		const tryPush = (event) => {
+			if (stream.readableLength >= highWaterMark) {
+				dropped++;
+				return;
+			}
+			if (dropped > 0) {
+				stream.push({ type: "lag", dropped });
+				dropped = 0;
+			}
+			stream.push(event);
+		};
 
-		for (const key of keys) {
-			const listener = (value) => {
-				if (values.get(key) !== value) {
-					// add the value to the local map
-					// it is ok to overwrite if not consumed yet
-					values.set(key, value);
+		let detach;
+		if (kind === "topic") {
+			const listener = (payload) => tryPush(payload);
+			this.#topicEmitter.on(selector.topic, listener);
+			detach = () => this.#topicEmitter.off(selector.topic, listener);
+		} else {
+			const listener = (event) => {
+				if (!predicate(event)) return;
+				if (!eventFilter(event.type)) return;
+				if (event.type === "clear") {
+					tryPush({ type: "clear" });
+				} else if (event.type === "set") {
+					tryPush({
+						type: "set",
+						key: event.normalizedKey,
+						value: event.value,
+					});
+				} else {
+					tryPush({ type: "delete", key: event.normalizedKey });
 				}
 			};
-			this.#keysListener.on(getSerializedKeyFromRawKey(key), listener);
-			listeners.push(listener);
+			this.#keyEmitter.on(KEY_CHANGED, listener);
+			detach = () => this.#keyEmitter.off(KEY_CHANGED, listener);
 		}
 
-		function* generate() {
-			while (true) {
-				const entries = [];
-				for (const key of keys) {
-					const value = values.get(key) ?? null;
-					entries.push({ key, value });
-					// make sure to clear up the local map once dumped
-					values.delete(key);
-				}
-				// console.log({ entries });
-				if (entries.some((entry) => entry.value !== null)) {
-					yield entries;
-				}
-			}
-		}
-
-		const readable = Readable.from(generate(), { emitClose: true });
-		readable.on("close", () => {
-			keys.forEach((key, i) => {
-				this.#keysListener.off(getSerializedKeyFromRawKey(key), listeners[i]);
-			});
-			this.#removeKeysFromWatcher(keys);
-			ac.abort();
+		stream.on("close", () => {
+			detach();
+			this.#subscriptions.delete(stream);
 		});
-		return readable;
+		return stream;
+	}
+
+	/**
+	 * Publish a payload on a custom topic. Topics live in their own namespace
+	 * (independent of the key store) and have no event-type taxonomy.
+	 * @param {string} topic
+	 * @param {*} payload
+	 */
+	publish(topic, payload) {
+		this.#assertIsNotClosed();
+		assertValidTopic(topic, ERR_KVSTORE_INVALID_TOPIC);
+		this.#topicEmitter.emit(topic, payload);
+	}
+
+	#compileSelector(selector) {
+		if (!selector || typeof selector !== "object") {
+			throw new ERR_KVSTORE_INVALID_SELECTOR(SELECTOR_SHAPE_MESSAGE);
+		}
+		const { key, keys, prefix, topic } = selector;
+		const provided = [key, keys, prefix, topic].filter(
+			(v) => v !== undefined,
+		).length;
+		if (provided !== 1) {
+			throw new ERR_KVSTORE_INVALID_SELECTOR(SELECTOR_SHAPE_MESSAGE);
+		}
+		if (topic !== undefined) {
+			assertValidTopic(topic, ERR_KVSTORE_INVALID_SELECTOR);
+			return { kind: "topic", predicate: null };
+		}
+		if (key !== undefined) {
+			const { encoded } = encodeKey(key);
+			return {
+				kind: "key",
+				predicate: (e) =>
+					e.type === "clear" ? true : e.encodedKey === encoded,
+			};
+		}
+		if (keys !== undefined) {
+			if (!Array.isArray(keys) || keys.length === 0) {
+				throw new ERR_KVSTORE_INVALID_SELECTOR(
+					"keys must be a non-empty array of keys",
+				);
+			}
+			const encodedSet = new Set(keys.map((k) => encodeKey(k).encoded));
+			return {
+				kind: "keys",
+				predicate: (e) =>
+					e.type === "clear" ? true : encodedSet.has(e.encodedKey),
+			};
+		}
+		// prefix
+		const { encoded } = encodePrefix(prefix);
+		const bounds = prefixBounds(encoded);
+		return {
+			kind: "prefix",
+			predicate: (e) => {
+				if (e.type === "clear") return true;
+				if (e.encodedKey < bounds.start) return false;
+				return bounds.end === null || e.encodedKey < bounds.end;
+			},
+		};
+	}
+
+	#compileEventFilter(events) {
+		if (events === undefined) return () => true;
+		if (!Array.isArray(events) || events.length === 0) {
+			throw new ERR_KVSTORE_INVALID_SELECTOR(
+				"events must be a non-empty array",
+			);
+		}
+		const invalid = events.find((e) => !VALID_KEY_EVENTS.has(e));
+		if (invalid !== undefined) {
+			throw new ERR_KVSTORE_INVALID_SELECTOR(
+				`events contains an invalid event type: ${JSON.stringify(invalid)} (expected "set", "delete", or "clear")`,
+			);
+		}
+		const allowed = new Set(events);
+		return (type) => allowed.has(type);
 	}
 }
 
-export default KVLite;
+/**
+ * Open a KV store. Documented entry point of the module — `KVStore` itself
+ * is exported too, for `instanceof` checks and typing.
+ * @param {{path?: string}} [options]
+ * @returns {KVStore}
+ */
+export function openKv(options) {
+	return new KVStore(options);
+}
+
+export { KVStore };
