@@ -1,30 +1,41 @@
 # KV store
 
-> Stability: 1.1 - Active development.
+<!--introduced_in=REPLACEME-->
 
-The `node:kvstore` module facilitates working with KV store database.
+<!-- YAML
+added: REPLACEME
+-->
+
+> Stability: 1 - Experimental.
+
+<!-- source_link=src/kv.mjs -->
+
+The `node:kvstore` module facilitates working with a KV store database.
 To access it:
 
 ```mjs
-import kv from 'node:kvstore';
+import { openKv } from 'node:kvstore';
 ```
 
 ```cjs
-const kv = require('node:kvstore');
+const { openKv } = require('node:kvstore');
 ```
 
-This module is only available under the `node:` scheme.
+This module is only available under the `node:` scheme. The current
+implementation is backed by the `node:sqlite` module, and every API it
+exposes is synchronous (matching `node:sqlite`'s own `DatabaseSync`).
 
-The following example shows the basic usage of the `node:kvstore` module to open
-an in-memory key-value database, write data to the database, and then read the data back.
+The following example shows the basic usage of the `node:kvstore` module to
+open an in-memory key-value database, write data to the database, and then
+read the data back.
 
 ```mjs
-import { opevKv } from 'node:kvstore';
-const kv = openKv({ memory: true });
+import { openKv } from 'node:kvstore';
+const kv = openKv();
 
 // set few values
-kv.set('testing-key', {text: 'Hello'});
-kv.set('other-key', {text: 'World'});
+kv.set('testing-key', { text: 'Hello' });
+kv.set('other-key', { text: 'World' });
 
 // fetch multiple keys
 const entries = kv.getMany(['testing-key', 'other-key']);
@@ -32,23 +43,23 @@ const entries = kv.getMany(['testing-key', 'other-key']);
 console.log(entries);
 // Prints: [{key: ['testing-key'], value: {text: "Hello"}}, {key: ['other-key], value: {text: "World"}}]
 
-// get the list of keys within the store as iterator
-for( const key of kv.keys()){
-    // Log the list of keys in the store
-    console.log(key);
-    // Prints: { key: 'testing-key'}
-    // Prints: { key: 'other-key' }
+// get the list of keys within the store as an iterator
+for (const key of kv.keys({ prefix: [] })) {
+  // Log the list of keys in the store
+  console.log(key);
+  // Prints: { key: ['testing-key'] }
+  // Prints: { key: ['other-key'] }
 }
 ```
 
 ```cjs
 'use strict';
-const { opevKv } = require("node:kvstore");
-const kv = openKv({ memory: true });
+const { openKv } = require('node:kvstore');
+const kv = openKv();
 
 // set few values
-kv.set('testing-key', {text: 'Hello'});
-kv.set('other-key', {text: 'World'});
+kv.set('testing-key', { text: 'Hello' });
+kv.set('other-key', { text: 'World' });
 
 // fetch multiple keys
 const entries = kv.getMany(['testing-key', 'other-key']);
@@ -56,198 +67,445 @@ const entries = kv.getMany(['testing-key', 'other-key']);
 console.log(entries);
 // Prints: [{key: ['testing-key'], value: {text: "Hello"}}, {key: ['other-key], value: {text: "World"}}]
 
-// get the list of keys within the store as iterator
-for( const key of kv.keys()){
-    // Log the list of keys in the store
-    console.log(key);
-    // Prints: { key: 'testing-key'}
-    // Prints: { key: 'other-key' }
+// get the list of keys within the store as an iterator
+for (const key of kv.keys({ prefix: [] })) {
+  // Log the list of keys in the store
+  console.log(key);
+  // Prints: { key: ['testing-key'] }
+  // Prints: { key: ['other-key'] }
 }
 ```
-
-## Usage
-
-```
-node --experimental-kvstore app.js
-```
-
-* `--experimental-kvstore` Enables the experimental KV store feature.
-
-The current implementation is backed by the `node:sqlite` module.
 
 ## The `KeyValue` type
 
-A key can be either a `string` or an array of either `string`, `boolean`, `number`, `bigint` values.
-The `string` notation is just a shorthand for `[string]`.
+A key can be either a `string` or an array of `string`, `boolean`, `number`,
+or `bigint` values. The `string` notation is just a shorthand for `[string]`.
 
-## `kvstore.openKv([options])`
+Composite keys sort in a fixed, well-defined order — both across segments of
+the same type and across types: `string < number < bigint < boolean`. This
+makes range and prefix queries ("give me everything between key A and key
+B") behave the way you'd expect from any ordered key-value store.
 
-This method creates a new KV store instance and establish a connection to it.
-All APIs exposed by this method are executed synchronously (unless stated otherwise).
+Segment-level notes:
 
-```mjs
-import { opevKv } from 'node:kvstore';
-const kv = openKv({ memory: true });
-```
-```cjs
-'use strict';
-const { opevKv } = require("node:kvstore");
-const kv = openKv({ memory: true });
-```
+* **Strings** sort by UTF-8 byte order. Any string is valid except the
+  literal empty string `''` — whitespace-only strings (e.g. `' '`) are fine.
+* **Numbers** are IEEE-754 doubles and sort numerically (not
+  lexicographically): `-300 < -5 < 0 < 5 < 300`. `NaN` is **not** a valid key
+  segment (it can't be compared equal to itself) and throws.
+  `Infinity`/`-Infinity` are valid and sort at the extreme ends of the number
+  range. `-0` is normalized to `0` — they encode and compare identically.
+* **Bigints** sort numerically with arbitrary precision, up to a magnitude of
+  255 bytes (about 2040 bits — far beyond any realistic id or timestamp). A
+  larger bigint throws `ERR_KVSTORE_BIGINT_TOO_LARGE` (see [Errors][] below).
+* **Booleans** sort `false < true`.
+
+A key's encoded form must not exceed 1024 bytes; oversized keys throw.
+
+## Type conversion between JavaScript and stored values
+
+Values passed to [`kv.set(key, value)`][] are serialized with Node's
+`v8.serialize` (the same algorithm used by `worker_threads.postMessage`). The
+following round-trip losslessly:
+
+* primitives, including `undefined` and `BigInt`
+* `Date`, `RegExp`, `Map`, `Set`, typed arrays, `ArrayBuffer`, `DataView`
+* sparse arrays and circular references
+
+What's **not** preserved:
+
+* functions (cannot be cloned)
+* class identity — instances round-trip as plain objects/Maps/Sets
+* DOM-only types (irrelevant in Node)
+
+The on-disk format is V8-internal: stable across Node versions, but not
+portable to other runtimes (Bun, Deno, browsers). Pick a wire format like
+CBOR if cross-runtime portability matters.
+
+## Class: `KVStore`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+This class represents a single connection to a KV store. All APIs exposed by
+this class execute synchronously. Instances are created with
+[`kvstore.openKv([options])`][], not with `new` — `KVStore` is exported only
+so callers can perform `instanceof` checks and reference the type.
+
+### `kv.clear()`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+Deletes every key in the database.
 
 ### `kv.close()`
 
-Close the connection to the database.
-If the connection is already closed, this method does nothing.
+<!-- YAML
+added: REPLACEME
+-->
 
-### `kv.delete(keys)`
+Closes the connection to the store. If the connection is already closed,
+this method does nothing.
 
-Removes from the KV store the entry associated with the provided key.
+### `kv.delete(key)`
 
-* `keys` {string|(string|number|bigint|boolean)[]}  The key to delete
+<!-- YAML
+added: REPLACEME
+-->
 
-Returns a `boolean` result hinting the effective change int he store: `true` if deleted, `false` otherwise.
+* `key` {KeyValue} The key to delete.
+* Returns: {boolean} `true` if an entry was deleted, `false` otherwise.
 
-### `kv.flush()`
+Removes the entry associated with `key`, if one exists.
 
-Delete all the keys in the database.
+### `kv.get(key)`
 
-### `kv.get(key[, options])`
+<!-- YAML
+added: REPLACEME
+-->
 
-Retrieve the value associated with the given key.
-If no value exists for the given key, the returned entry will have a `null` value.
+* `key` {KeyValue}
+* Returns: {Object}
+  * `key` {KeyValue}
+  * `value` {any} `null` if no value exists for the given key.
+
+Retrieves the value associated with `key`.
+
+**Note:** a stored value that genuinely *is* `null` is indistinguishable
+from an absent key in 1.0 — both return `value: null`. Disambiguating the
+two (e.g. via a returned `versionstamp`) is tracked for a 1.x release;
+there's no workaround today beyond not storing `null` as a value where the
+distinction matters to your application.
 
 ```mjs
-import { opevKv } from 'node:kvstore';
-const kv = openKv({ memory: true });
+import { openKv } from 'node:kvstore';
+const kv = openKv();
 
-// set few values
-kv.set('hello', {text: 'World'});
+kv.set('hello', { text: 'World' });
 
-// Log the entries for the given keys
 console.log(kv.get('hello'));
 // Prints: {key: ['hello'], value: {text: "World"}}
 ```
+
 ```cjs
-const { opevKv } = require("node:kvstore");
-const kv = openKv({ memory: true });
+const { openKv } = require('node:kvstore');
+const kv = openKv();
 
-// set few values
-kv.set('hello', {text: 'World'});
+kv.set('hello', { text: 'World' });
 
-// Log the entries for the given keys
 console.log(kv.get('hello'));
 // Prints: {key: ['hello'], value: {text: "World"}}
 ```
 
-### `kv.getMany(keys[, options])`
+### `kv.getMany(keys)`
 
-Retrieve the values associated with the given keys.
-The returned array will have the same length as the `keys` array and the entries
-will be in the same order as the keys.
-If no value exists for the given key, the returned entry will have a `null` value.
+<!-- YAML
+added: REPLACEME
+-->
 
-* `keys` {KeyValue[]} An array of `key` values to retrieve from the store
+* `keys` {KeyValue\[]} An array of keys to retrieve from the store.
+* Returns: {Object\[]} An array the same length as `keys`, with entries in
+  the same order as `keys`. Each entry has the same shape as
+  [`kv.get(key)`][]'s return value.
 
-### `kv.keys(selector[, options])`
+Retrieves the values associated with each of `keys`. If no value exists for
+a given key, its entry has a `null` value (same caveat as `kv.get()` above).
 
-Retrieve the keys associated with the given selector.
+### `kv.keys(selector)`
 
-* `selector` {{ prefix: KeyValue, start?: KeyValue, end?: KeyValue}|{start: KeyValue, end: KeyValue}}: it can be either a prefix based selector or a range based selector. A prefix selector can have express an offset `start` or `end` value (but not both).
+<!-- YAML
+added: REPLACEME
+-->
 
-The result is an iterator:
+* `selector` {Object} Either a prefix-based selector or a range-based
+  selector:
+  * `prefix` {KeyValue} Matches keys nested under `prefix`, never the prefix
+    key itself. An empty prefix (`[]`) matches every key in the store — this
+    is the recipe for a full scan; there is no separate "list everything"
+    method, precisely so that scanning the whole store is always an
+    explicit, visible choice at the call site.
+  * `start` {KeyValue} Inclusive lower bound. Can be combined with `prefix`
+    as an offset (but not together with `end` both falling outside the
+    prefix's key space).
+  * `end` {KeyValue} Inclusive upper bound. Same combination rules as
+    `start`.
+* Returns: {Iterable} An iterator of `{ key: KeyValue }` objects.
+
+Retrieves the keys matching `selector`.
 
 ```mjs
-import { opevKv } from 'node:kvstore';
-const kv = openKv({ memory: true });
+import { openKv } from 'node:kvstore';
+const kv = openKv();
 
-kv.set('testing-key', {text: 'Hello'});
-kv.set('other-key', {text: 'World'});
+kv.set('testing-key', { text: 'Hello' });
+kv.set('other-key', { text: 'World' });
 
-// get the list of keys within the store as iterator
-for( const key of kv.keys()){
-    // Log the list of keys in the store
-    console.log(key);
-    // Prints: { key: 'testing-key'}
-    // Prints: { key: 'other-key' }
+// get the list of keys within the store as an iterator
+for (const key of kv.keys({ prefix: [] })) {
+  // Log the list of keys in the store
+  console.log(key);
+  // Prints: { key: ['testing-key'] }
+  // Prints: { key: ['other-key'] }
 }
 ```
+
 ```cjs
-const { opevKv } = require("node:kvstore");
-const kv = openKv({ memory: true });
+const { openKv } = require('node:kvstore');
+const kv = openKv();
 
-kv.set('testing-key', {text: 'Hello'});
-kv.set('other-key', {text: 'World'});
+kv.set('testing-key', { text: 'Hello' });
+kv.set('other-key', { text: 'World' });
 
-// get the list of keys within the store as iterator
-for( const key of kv.keys()){
-    // Log the list of keys in the store
-    console.log(key);
-    // Prints: { key: 'testing-key'}
-    // Prints: { key: 'other-key' }
+// get the list of keys within the store as an iterator
+for (const key of kv.keys({ prefix: [] })) {
+  // Log the list of keys in the store
+  console.log(key);
+  // Prints: { key: ['testing-key'] }
+  // Prints: { key: ['other-key'] }
 }
+```
+
+### `kv.publish(topic, payload)`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `topic` {string} A non-empty topic name.
+* `payload` {any} Any value, delivered to topic subscribers as-is.
+
+Publishes `payload` to `topic`. Topics live in their own namespace,
+independent of the key store — see [Topic plane][] below.
+
+```mjs
+kv.publish('events.signup', { userId: 42 });
 ```
 
 ### `kv.set(key, value)`
 
-Set the value associated with the given key.
+<!-- YAML
+added: REPLACEME
+-->
 
-* `key` {KeyValue} - the key to set
-* `value` {*} - Any serializable object to store
+* `key` {KeyValue} The key to set.
+* `value` {any} Any structured-cloneable value to store. See
+  [Type conversion between JavaScript and stored values][].
+* Returns: `undefined`
 
-Note that additional call to `set` with the same `key` will overwrite the value.
+Sets the value associated with `key`, overwriting any existing value at that
+key. Throws on error; otherwise returns nothing — there's no `{ ok }`
+envelope, since under SQLite UPSERT semantics a no-op write of an identical
+value would also report zero changed rows, and `{ ok: false }` would
+misleadingly read as "the write failed."
 
 ```mjs
-import { opevKv } from 'node:kvstore';
-const kv = openKv({ memory: true });
+import { openKv } from 'node:kvstore';
+const kv = openKv();
 
-kv.set('testing-key', {text: 'Hello'});
-...
-kv.set('testing-key', {text: 'World'});
+kv.set('testing-key', { text: 'Hello' });
+// ...
+kv.set('testing-key', { text: 'World' });
 
-// get the value associated with 'testing-key'
-console.log(kb.get('testing-key'));
-// Prints { key: ['testing-key'], value: {text: 'World'}}
-```
-```cjs
-const { opevKv } = require("node:kvstore");
-const kv = openKv({ memory: true });
-
-kv.set('testing-key', {text: 'Hello'});
-...
-kv.set('testing-key', {text: 'World'});
-
-// get the value associated with 'testing-key'
-console.log(kb.get('testing-key'));
+console.log(kv.get('testing-key'));
 // Prints { key: ['testing-key'], value: {text: 'World'}}
 ```
 
-### `kv.watch(keys)`
+```cjs
+const { openKv } = require('node:kvstore');
+const kv = openKv();
 
-Watch for changes to the given keys.
-The method returns a `ReadableStream` to listen to changes on the store for the given keys.
+kv.set('testing-key', { text: 'Hello' });
+// ...
+kv.set('testing-key', { text: 'World' });
 
-* `keys` {KeyValue[]} An array of keys to watch
+console.log(kv.get('testing-key'));
+// Prints { key: ['testing-key'], value: {text: 'World'}}
+```
 
-Note that the returned `entries` will have the same order of the provided `keys` array: for entires whose `key` have no changed the entry `value` will be set to `null`.
+### `kv.watch(selector[, options])`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `selector` {Object} Exactly one of:
+  * `key` {KeyValue} Fires on mutations to that exact key (and on `clear`).
+    Also accepts `events` (see below).
+  * `keys` {KeyValue\[]} Fires on mutations to any of the listed exact keys
+    (and on `clear`). Also accepts `events`.
+  * `prefix` {KeyValue} Fires on mutations to any key under the prefix (and
+    on `clear`). An empty prefix (`[]`) watches every key-plane mutation in
+    the store. Also accepts `events`.
+  * `topic` {string} Fires on [`kv.publish(topic, payload)`][] calls.
+  * `events` {string\[]} For the `key`/`keys`/`prefix` forms, restricts
+    delivery to a subset of `'set'`, `'delete'`, `'clear'`.
+* `options` {Object}
+  * `highWaterMark` {number} Per-watcher buffer size. Must be `>= 1` (throws
+    otherwise). If the buffer is full, intervening events are dropped and a
+    single `{type:'lag', dropped}` event is delivered once space frees up.
+    **Default:** `1024`.
+* Returns: {stream.Readable} An object-mode `Readable`, also usable as an
+  `AsyncIterable`, that emits one event per push. Call `stream.destroy()` to
+  unsubscribe.
+
+Watches mutations on the store, or messages on a custom topic.
+
+Key / keys / prefix watchers emit one of:
+
+```js
+{ type: 'set',    key: KeyValue, value: any }
+{ type: 'delete', key: KeyValue }
+{ type: 'clear' }
+{ type: 'lag',    dropped: number }   // see Backpressure
+```
+
+Topic watchers emit the published payload directly (no envelope).
 
 ```mjs
-import { opevKv } from 'node:kvstore';
-const kv = openKv({ memory: true });
-
-const stream = kv.watch(['testing-key']);
-
-for await (const entries of stream) {
-	doStuff(entries);
+const sub = kv.watch({ prefix: ['user'] });
+for await (const event of sub) {
+  // { type: 'set', key: ['user', 42], value: {...} } | ...
 }
 ```
+
+> **Migration from 0.x.** The legacy positional form `kv.watch(keys[])` has
+> been replaced. Use `kv.watch({ keys: [...] })` instead, and note that the
+> stream now emits one event per change (not a positional `entries[]` array
+> with `null` placeholders).
+
+#### Topic plane
+
+`kv.publish()`/`kv.watch({ topic })` is a separate plane from key-value
+mutations, with its own guarantees:
+
+* **Scope.** Topics live only in the same Node process as the `KVStore`
+  instance — they do not cross process boundaries, do not persist to disk,
+  and do not cross machines. Restarting the process, or opening a second
+  `KVStore` pointed at the same file, gets no history.
+* **Isolation from the key plane.** `publish()` never touches the underlying
+  table; key-plane `set`/`delete`/`clear` never appear on topic streams;
+  topic names share no namespace with keys (a topic named `'user'` and a key
+  `['user']` are unrelated).
+* **Ordering.** Within a single topic, payloads delivered to one watcher
+  arrive FIFO (publish order). There is no ordering guarantee *across*
+  different topics.
+* **Delivery.** Best-effort, in-process, at-most-once. No retries, no
+  persistence — a payload published while no watcher is attached to that
+  topic is simply gone.
+* **Lifecycle.** Topic streams end when [`kv.close()`][] is called, exactly
+  like key-plane watchers.
+
+#### Backpressure
+
+Watchers must consume events in a timely manner. Each watcher has its own
+independent buffer — a slow watcher never affects any other watcher or the
+publisher.
+
+* **Drop policy.** When a watcher's buffer reaches `highWaterMark`, the
+  *new* incoming event is dropped (the buffer keeps what it already has,
+  rather than evicting older events).
+* **`lag` event.** Exactly one `{type:'lag', dropped}` event is emitted per
+  drop episode, once the buffer has drained back below `highWaterMark`, and
+  always *before* the next non-`lag` event is delivered. `dropped` counts
+  every event lost since the previous `lag` event (or since the stream
+  started) and is always `> 0`.
+* **`close()` during a drop window.** [`kv.close()`][] ends every
+  outstanding stream immediately. Any pending `lag` event for an unflushed
+  drop window is **not** emitted — the stream simply ends.
+
+## `kvstore.openKv([options])`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `options` {Object} Configuration options for the store connection.
+  * `path` {string} On-disk database file. When omitted, the store is
+    ephemeral (in-memory) — `openKv()` with no arguments has no disk side
+    effect.
+* Returns: {KVStore}
+
+Creates a new [`KVStore`][] instance and establishes a connection to it. This
+is the documented entry point for obtaining a `KVStore`; all APIs it exposes
+execute synchronously (unless stated otherwise).
+
+```mjs
+import { openKv } from 'node:kvstore';
+
+const ephemeral = openKv();
+const persistent = openKv({ path: './my-store.sqlite' });
+```
+
 ```cjs
-const { opevKv } = require("node:kvstore");
-const kv = openKv({ memory: true });
+'use strict';
+const { openKv } = require('node:kvstore');
 
-const stream = kv.watch(['testing-key']);
+const ephemeral = openKv();
+const persistent = openKv({ path: './my-store.sqlite' });
+```
 
-for await (const entries of stream) {
-	doStuff(entries);
+**Storage.** A file-backed store runs with `PRAGMA journal_mode=WAL` and
+`PRAGMA synchronous=NORMAL` always on (there is no option to disable this).
+This means two sidecar files, `<path>-wal` and `<path>-shm`, exist alongside
+the database file while it's open. They're removed automatically on a clean
+[`kv.close()`][]. If you copy or back up the database file while a store has
+it open, copy the sidecars too (or checkpoint first) — copying just the
+`.sqlite` file mid-write is not safe.
+
+## Errors
+
+Every error thrown by this module is a plain `Error`, `TypeError`, or
+`RangeError` instance — this module does not export a bespoke error class
+hierarchy — carrying a stable `.code` string, so callers can branch on
+failure kind without parsing `.message`:
+
+| `.code`                        | Base         | Thrown when                                                                                       |
+| ------------------------------- | ------------ | -------------------------------------------------------------------------------------------------- |
+| `ERR_KVSTORE_CLOSED`            | `Error`      | Any method called after [`kv.close()`][].                                                          |
+| `ERR_KVSTORE_INVALID_KEY`       | `TypeError`  | A key violates type, segment, or byte-limit constraints (also thrown by `getMany()`'s per-element validation). |
+| `ERR_KVSTORE_BIGINT_TOO_LARGE`  | `RangeError` | A bigint key segment's magnitude exceeds 255 bytes.                                                |
+| `ERR_KVSTORE_INVALID_KEYS`      | `TypeError`  | `getMany()`'s argument itself (the list of keys) is malformed.                                     |
+| `ERR_KVSTORE_INVALID_SELECTOR`  | `TypeError`  | `keys()` or `watch()` selector/options errors.                                                     |
+| `ERR_KVSTORE_INVALID_TOPIC`     | `TypeError`  | `publish()`'s topic argument is malformed.                                                         |
+
+```mjs
+import { openKv } from 'node:kvstore';
+
+const kv = openKv();
+kv.close();
+try {
+  kv.get('x');
+} catch (err) {
+  if (err.code === 'ERR_KVSTORE_CLOSED') {
+    console.log(err instanceof Error); // true
+  }
 }
 ```
+
+```cjs
+'use strict';
+const { openKv } = require('node:kvstore');
+
+const kv = openKv();
+kv.close();
+try {
+  kv.get('x');
+} catch (err) {
+  if (err.code === 'ERR_KVSTORE_CLOSED') {
+    console.log(err instanceof Error); // true
+  }
+}
+```
+
+[Errors]: #errors
+[Topic plane]: #topic-plane
+[Type conversion between JavaScript and stored values]: #type-conversion-between-javascript-and-stored-values
+[`KVStore`]: #class-kvstore
+[`kv.close()`]: #kvclose
+[`kv.get(key)`]: #kvgetkey
+[`kv.publish(topic, payload)`]: #kvpublishtopic-payload
+[`kv.set(key, value)`]: #kvsetkey-value
+[`kvstore.openKv([options])`]: #kvstoreopenkvoptions

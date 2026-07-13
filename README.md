@@ -11,11 +11,22 @@ Developed by @lifeisfoo @fabio-sp @arnymore @alfiuzzo89.
 ## Usage
 
 ```js
-import KVLite from "./kv.mjs";
+import { openKv } from "./src/kv.mjs";
 
-const kv = new KVLite();
-const result = kv.set(argv[2], argv[3]);
+const kv = openKv();
+kv.set(argv[2], argv[3]);
 const retrieved = kv.get(argv[2]);
+```
+
+## Examples
+
+A runnable example suite covering every public method, each `watch` selector
+form, the v8 value contract, and several end-to-end use cases (TTL cache,
+session store, work queue, audit log, …) lives in [examples/](examples/).
+See [EXAMPLES.md](EXAMPLES.md) for an index, or run them all with:
+
+```sh
+npm run examples
 ```
 
 ## License
