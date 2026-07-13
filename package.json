@@ -14,17 +14,19 @@
 	},
 	"files": ["src", "kv.d.ts", "kv.md", "README.md", "LICENSE"],
 	"engines": {
-		"node": ">=22.5"
+		"node": ">=22.13.0"
 	},
 	"scripts": {
 		"test": "node --test 'src/**/*.test.mjs'",
+		"test:coverage": "node --test --experimental-test-coverage --test-coverage-exclude='**/*.test.mjs' --test-coverage-lines=100 --test-coverage-branches=100 --test-coverage-functions=100 'src/**/*.test.mjs'",
 		"lint": "biome check src/",
 		"format": "biome format --write src/",
 		"examples": "for f in examples/*.mjs; do echo \"--- $f ---\"; NODE_NO_WARNINGS=1 node \"$f\" || exit 1; done",
 		"bundle": "node scripts/bundle.mjs",
 		"test:bundle": "npm run bundle && node --test dist/kv.bundle.test.mjs",
 		"typecheck": "tsc --noEmit",
-		"test:all": "npm run test && npm run test:bundle && npm run typecheck"
+		"bench": "NODE_NO_WARNINGS=1 node bench/run.mjs",
+		"test:all": "npm run test:coverage && npm run test:bundle && npm run typecheck"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.2.0",
